@@ -1,0 +1,76 @@
+flowchart TD
+    subgraph P0["P0 · 事件底座"]
+        direction TB
+        P0a["定义 event schema<br/>(ts/segment_id/run_id/actor/type/payload)"]
+        P0b["append-only JSONL writer"]
+        P0c["harness 观测包装<br/>(抓 file_changed / test_run / exit_code)"]
+        P0d["极简只读视图 (tail / 静态页)"]
+        P0a --> P0b --> P0c --> P0d
+    end
+
+    subgraph P1["P1 · Plan 契约 + ID 主线"]
+        direction TB
+        P1a["REQ-ID 命名规范"]
+        P1b["product.md 模板 (what / why)"]
+        P1c["tech.md 模板 (how)"]
+        P1d["ROADMAP.md 大节点引用 REQ-ID"]
+        P1a --> P1b --> P1c --> P1d
+    end
+
+    subgraph P2["P2 · Segment 契约 + 交接记录 schema"]
+        direction TB
+        P2a["契约字段<br/>(REQ覆盖 / 验收 / anti-scope / 依赖)"]
+        P2b["seq diagram + html 预览 (验收靶子)"]
+        P2c["交接记录 schema<br/>(接口 / 决策理由 / 已知限制)"]
+        P2d["slice-generate 陪跑 (先半手动确认)"]
+        P2a --> P2b --> P2c --> P2d
+    end
+
+    subgraph P3["P3 · 单 segment 执行 (LangGraph)"]
+        direction TB
+        P3a["LangGraph 骨架<br/>(orchestrator / work / test 节点)"]
+        P3b["sandbox = git worktree 创建/销毁"]
+        P3c["work / test session 分离<br/>(test 只喂 spec)"]
+        P3d["implement→test→fix 条件边 (cycle)"]
+        P3e["全程写 events (不信 agent 自报)"]
+        P3a --> P3b --> P3c --> P3d --> P3e
+    end
+
+    subgraph P4["P4 · review + audit + 人类合入闸"]
+        direction TB
+        P4a["反向生成 图/html → 对比契约 (漂移检测)"]
+        P4b["确定性硬闸<br/>(secret / 新依赖 / 破坏性操作)"]
+        P4c["LLM 软告警 (升级人类)"]
+        P4d["human interrupt 合入闸"]
+        P4e["merge → 生成交接记录"]
+        P4a --> P4b --> P4c --> P4d --> P4e
+    end
+
+    subgraph P5["P5 · 多 segment 串联"]
+        direction TB
+        P5a["干净上下文起步"]
+        P5b["按契约依赖加载交接记录"]
+        P5c["接口现读 (diff / AST)"]
+        P5d["串跑两个有依赖的 segment"]
+        P5a --> P5b --> P5c --> P5d
+    end
+
+    subgraph P6["P6 · 增强 (暂缓, 别提前做)"]
+        direction TB
+        P6a["动态 step 拆分"]
+        P6b["回归套件累积"]
+        P6c["漂亮 UI"]
+        P6d["并行 segment"]
+    end
+
+    P0 -->|"亲手: 手写事件能在视图看到"| P1
+    P1 -->|"亲手: 给真实小功能写出 plan"| P2
+    P2 -->|"亲手: 产出一个自包含契约"| P3
+    P3 -->|"亲手: 看一个 segment 跑绿"| P4
+    P4 -->|"亲手: 跑通完整 segment, 读报告点合入"| P5
+    P5 -->|"亲手: 跑通两个有依赖 segment"| P6
+
+    classDef todo fill:#f5f5f5,stroke:#bbb,color:#333;
+    classDef doing fill:#fff3cd,stroke:#e0a800,color:#333;
+    classDef done fill:#d4edda,stroke:#28a745,color:#333;
+    class P0,P1,P2,P3,P4,P5,P6 todo;

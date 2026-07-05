@@ -1,2 +1,16 @@
+# === Loom 控制平面 · runtime 事实产物(不进 git) ===
+# 不变量 B/C:事实由 harness 观测产生,不是手写意图,不纳入版本控制
 events.jsonl
-.codex-log/
+events.*.jsonl
+*.events.jsonl
+.loom-runtime/
+runs/
+
+# === 通用 ===
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+.DS_Store
+*:Zone.Identifier

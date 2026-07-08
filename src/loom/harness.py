@@ -5,9 +5,9 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Callable, TypeVar
 
-from .events import Event, append_event
+from .events import DEFAULT_EVENTS_PATH, Actor, Event, append_event
 
 
 @dataclass(frozen=True)
@@ -24,6 +24,9 @@ class FileChange:
     change_type: str
     before_hash: str | None
     after_hash: str | None
+
+
+T = TypeVar("T")
 
 
 def run_observed(cmd: str, *, segment_id: str, run_id: str) -> CommandResult:
@@ -99,6 +102,41 @@ def observe_files_changed(
         )
 
     return changes
+
+
+def observe_step(
+    work: Callable[[], T],
+    *,
+    actor: Actor,
+    step_name: str,
+    segment_id: str,
+    run_id: str,
+    path: Path | str = DEFAULT_EVENTS_PATH,
+) -> T:
+    append_event(
+        Event(
+            ts=_utc_now(),
+            segment_id=segment_id,
+            run_id=run_id,
+            actor=actor,
+            type="step_started",
+            payload={"step": step_name},
+        ),
+        path=path,
+    )
+    result = work()
+    append_event(
+        Event(
+            ts=_utc_now(),
+            segment_id=segment_id,
+            run_id=run_id,
+            actor=actor,
+            type="step_finished",
+            payload={"step": step_name, "result": result},
+        ),
+        path=path,
+    )
+    return result
 
 
 def _utc_now() -> str:

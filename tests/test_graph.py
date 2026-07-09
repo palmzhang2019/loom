@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -12,9 +13,13 @@ from loom.view import load_event_rows, render_html_document
 
 
 class P3ALangGraphTests(unittest.TestCase):
-    def test_run_segment_graph_emits_harness_written_node_events_in_order(self) -> None:
+    def test_run_segment_graph_uses_sandbox_and_emits_node_events(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             events_path = Path(tmpdir) / "events.jsonl"
+            execution_repo = Path(tmpdir) / "lingua-web"
+            execution_repo.mkdir()
+            _init_main_repo(execution_repo)
+            worktree_root = Path(tmpdir) / "loom-worktrees"
             contract_path = (
                 Path(__file__).resolve().parents[1]
                 / "specs"
@@ -25,19 +30,21 @@ class P3ALangGraphTests(unittest.TestCase):
 
             state = run_segment_graph(
                 contract_path=contract_path,
-                run_id="run-p3a-001",
+                run_id="run-graph-001",
                 events_path=events_path,
+                execution_repo_path=execution_repo,
+                worktree_root=worktree_root,
             )
 
             rows, invalid_lines = load_event_rows(
                 events_path,
-                run_id="run-p3a-001",
+                run_id="run-graph-001",
                 segment_id="MAT-REQ-001/S1",
             )
 
             self.assertEqual(invalid_lines, [])
             self.assertEqual(
-                [(row["actor"], row["type"]) for row in rows],
+                [(row["actor"], row["type"]) for row in rows if row["actor"] != "harness"],
                 [
                     ("orchestrator", "step_started"),
                     ("orchestrator", "step_finished"),
@@ -51,9 +58,14 @@ class P3ALangGraphTests(unittest.TestCase):
             self.assertEqual(state["step"]["segment_id"], "MAT-REQ-001/S1")
             self.assertIn("fake diff", state["work_result"]["diff"])
             self.assertTrue(state["test_result"]["passed"])
-            self.assertNotIn("raw_text", rows[1]["payload"]["result"]["segment"])
+            orchestrator_finished = next(
+                row
+                for row in rows
+                if row["actor"] == "orchestrator" and row["type"] == "step_finished"
+            )
+            self.assertNotIn("raw_text", orchestrator_finished["payload"]["result"]["segment"])
             self.assertEqual(
-                rows[1]["payload"]["result"]["segment"],
+                orchestrator_finished["payload"]["result"]["segment"],
                 {
                     "contract_path": str(contract_path),
                     "acceptance_ids": [
@@ -66,10 +78,26 @@ class P3ALangGraphTests(unittest.TestCase):
                     "covers_req": "MAT-REQ-001",
                 },
             )
+            self.assertFalse((worktree_root / "MAT-REQ-001-S1").exists())
+            command_runs = [row for row in rows if row["type"] == "command_run"]
+            self.assertGreaterEqual(len(command_runs), 4)
+            work_finished = next(
+                row
+                for row in rows
+                if row["actor"] == "work" and row["type"] == "step_finished"
+            )
+            self.assertIn(
+                str(worktree_root / "MAT-REQ-001-S1"),
+                work_finished["payload"]["result"]["work_result"]["sandbox_path"],
+            )
 
     def test_existing_view_renders_the_three_node_run(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             events_path = Path(tmpdir) / "events.jsonl"
+            execution_repo = Path(tmpdir) / "lingua-web"
+            execution_repo.mkdir()
+            _init_main_repo(execution_repo)
+            worktree_root = Path(tmpdir) / "loom-worktrees"
             contract_path = (
                 Path(__file__).resolve().parents[1]
                 / "specs"
@@ -80,20 +108,22 @@ class P3ALangGraphTests(unittest.TestCase):
 
             run_segment_graph(
                 contract_path=contract_path,
-                run_id="run-p3a-view",
+                run_id="run-graph-view",
                 events_path=events_path,
+                execution_repo_path=execution_repo,
+                worktree_root=worktree_root,
             )
 
             rows, invalid_lines = load_event_rows(
                 events_path,
-                run_id="run-p3a-view",
+                run_id="run-graph-view",
                 segment_id="MAT-REQ-001/S1",
             )
             html = render_html_document(
                 rows,
                 invalid_lines,
                 source_path=events_path,
-                run_id="run-p3a-view",
+                run_id="run-graph-view",
                 segment_id="MAT-REQ-001/S1",
             )
 
@@ -103,6 +133,25 @@ class P3ALangGraphTests(unittest.TestCase):
             self.assertIn("step_started", html)
             self.assertIn("step_finished", html)
             self.assertIn("MAT-REQ-001/S1", html)
+
+def _git(git_dir: Path, *args: str) -> str:
+    completed = subprocess.run(
+        ["git", *args],
+        cwd=git_dir,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return completed.stdout
+
+
+def _init_main_repo(git_dir: Path) -> None:
+    _git(git_dir, "init", "-b", "main")
+    _git(git_dir, "config", "user.name", "Loom Tests")
+    _git(git_dir, "config", "user.email", "loom-tests@example.com")
+    (git_dir / "README.md").write_text("baseline\n", encoding="utf-8")
+    _git(git_dir, "add", "README.md")
+    _git(git_dir, "commit", "-m", "baseline")
 
 
 if __name__ == "__main__":

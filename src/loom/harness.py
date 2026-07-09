@@ -29,7 +29,14 @@ class FileChange:
 T = TypeVar("T")
 
 
-def run_observed(cmd: str, *, segment_id: str, run_id: str) -> CommandResult:
+def run_observed(
+    cmd: str,
+    *,
+    segment_id: str,
+    run_id: str,
+    cwd: Path | str | None = None,
+    path: Path | str = DEFAULT_EVENTS_PATH,
+) -> CommandResult:
     started_at = time.monotonic()
     completed = subprocess.run(
         cmd,
@@ -37,6 +44,7 @@ def run_observed(cmd: str, *, segment_id: str, run_id: str) -> CommandResult:
         capture_output=True,
         text=True,
         check=False,
+        cwd=cwd,
     )
     duration_seconds = time.monotonic() - started_at
 
@@ -55,12 +63,15 @@ def run_observed(cmd: str, *, segment_id: str, run_id: str) -> CommandResult:
             type="command_run",
             payload={
                 "cmd": cmd,
+                "cwd": str(cwd) if cwd is not None else None,
                 "exit_code": result.exit_code,
                 "stdout": result.stdout,
                 "stderr": result.stderr,
                 "duration_seconds": result.duration_seconds,
             },
         )
+        ,
+        path=path,
     )
     return result
 

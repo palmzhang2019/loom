@@ -7,7 +7,14 @@ from typing import Any, TypedDict
 from langgraph.graph import END, START, StateGraph
 
 from .events import DEFAULT_EVENTS_PATH
-from .harness import observe_step
+from .harness import observe_step, run_observed
+from .sandbox import (
+    DEFAULT_EXECUTION_REPO_PATH,
+    DEFAULT_WORKTREE_ROOT,
+    Sandbox,
+    create_sandbox,
+    destroy_sandbox,
+)
 
 
 class GraphState(TypedDict, total=False):
@@ -15,6 +22,7 @@ class GraphState(TypedDict, total=False):
     events_path: str
     run_id: str
     segment_id: str
+    sandbox: dict[str, str]
     segment: dict[str, Any]
     step: dict[str, Any]
     work_result: dict[str, Any]
@@ -30,16 +38,34 @@ def run_segment_graph(
     contract_path: Path | str,
     run_id: str,
     events_path: Path | str = DEFAULT_EVENTS_PATH,
+    execution_repo_path: Path | str = DEFAULT_EXECUTION_REPO_PATH,
+    worktree_root: Path | str = DEFAULT_WORKTREE_ROOT,
 ) -> GraphState:
     contract_file = Path(contract_path)
+    segment_id = _extract_segment_id(contract_file)
+    sandbox = create_sandbox(
+        segment_id=segment_id,
+        repo_path=execution_repo_path,
+        worktree_root=worktree_root,
+        run_id=run_id,
+        events_path=events_path,
+    )
     initial_state: GraphState = {
         "contract_path": str(contract_file),
         "events_path": str(events_path),
         "run_id": run_id,
-        "segment_id": _extract_segment_id(contract_file),
+        "segment_id": segment_id,
+        "sandbox": _sandbox_to_state(sandbox),
     }
     graph = _build_graph()
-    return graph.invoke(initial_state)
+    try:
+        return graph.invoke(initial_state)
+    finally:
+        destroy_sandbox(
+            sandbox,
+            run_id=run_id,
+            events_path=events_path,
+        )
 
 
 def _build_graph():
@@ -79,10 +105,23 @@ def _orchestrator_node(state: GraphState) -> GraphState:
 def _work_node(state: GraphState) -> GraphState:
     def run() -> GraphState:
         step = state["step"]
+        sandbox = state["sandbox"]
+        command = run_observed(
+            "git rev-parse --show-toplevel",
+            segment_id=state["segment_id"],
+            run_id=state["run_id"],
+            cwd=sandbox["worktree_path"],
+            path=state["events_path"],
+        )
+        if command.exit_code != 0:
+            raise RuntimeError(command.stderr.strip() or "mock work command failed")
         return {
             "work_result": {
                 "step_id": step["id"],
                 "summary": "mock work completed",
+                "sandbox_path": sandbox["worktree_path"],
+                "branch_name": sandbox["branch_name"],
+                "observed_top_level": command.stdout.strip(),
                 "diff": (
                     f"fake diff for {step['segment_id']}\n"
                     "--- a/src/backend/routes/materials.py\n"
@@ -154,3 +193,12 @@ def _load_segment_contract(contract_path: Path) -> dict[str, Any]:
     parsed["covers_req"] = top_level_fields["covers_req"]
 
     return parsed
+
+
+def _sandbox_to_state(sandbox: Sandbox) -> dict[str, str]:
+    return {
+        "repo_path": str(sandbox.repo_path),
+        "worktree_path": str(sandbox.worktree_path),
+        "branch_name": sandbox.branch_name,
+        "base_branch": sandbox.base_branch,
+    }

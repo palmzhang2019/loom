@@ -9,3 +9,7 @@
 - 当前所有事件写在单个 events.jsonl,定位某次执行需按 run_id/segment_id 过滤。
 - 多 run 并行时检索会变麻烦,取证易误读到旧行(P0c 取证时已遇到一次)。
 - P3/P5 多 run 并行前需考虑按 run/segment 切分或建检索手段。现在不做(避免过早优化)。
+
+## 操作提醒:grep 源码跳过缓存
+- __pycache__ 里的 .pyc 会保留旧模块名,grep 验证改名/删除时会被这些二进制缓存干扰。
+- 验证源码时用 grep --include='*.py' 或先清 __pycache__,避免被陈旧缓存误导。

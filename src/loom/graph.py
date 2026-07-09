@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, TypedDict
+from typing import Any, Callable, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
@@ -31,6 +32,40 @@ class GraphState(TypedDict, total=False):
 
 _TOP_LEVEL_FIELD_PATTERN = re.compile(r"^(segment_id|covers_req|title):\s*(.+)$", re.MULTILINE)
 _ACCEPTANCE_ID_PATTERN = re.compile(r"^\s*-\s+id:\s*(.+)$", re.MULTILINE)
+_ACCEPTANCE_ENTRY_PATTERN = re.compile(
+    r"^\s*-\s+id:\s*(.+)\n\s+text:\s*(.+)$",
+    re.MULTILINE,
+)
+_SEQUENCE_DIAGRAM_PATTERN = re.compile(
+    r"^preview:\n\s+sequence_diagram:\s*\|\n(?P<body>(?:\s{4}.+\n?)*)",
+    re.MULTILINE,
+)
+
+
+@dataclass(frozen=True)
+class WorkSessionInput:
+    step_id: str
+    segment_id: str
+    sandbox_path: str
+    branch_name: str
+    run_id: str
+    events_path: str
+
+
+@dataclass(frozen=True)
+class AcceptanceCriterion:
+    id: str
+    text: str
+
+
+@dataclass(frozen=True)
+class TestSessionInput:
+    acceptance: list[AcceptanceCriterion]
+    sequence_diagram: str
+
+
+WorkRunner = Callable[[WorkSessionInput], dict[str, Any]]
+TestRunner = Callable[[TestSessionInput], dict[str, Any]]
 
 
 def run_segment_graph(
@@ -40,6 +75,8 @@ def run_segment_graph(
     events_path: Path | str = DEFAULT_EVENTS_PATH,
     execution_repo_path: Path | str = DEFAULT_EXECUTION_REPO_PATH,
     worktree_root: Path | str = DEFAULT_WORKTREE_ROOT,
+    work_runner: WorkRunner | None = None,
+    test_runner: TestRunner | None = None,
 ) -> GraphState:
     contract_file = Path(contract_path)
     segment_id = _extract_segment_id(contract_file)
@@ -57,7 +94,10 @@ def run_segment_graph(
         "segment_id": segment_id,
         "sandbox": _sandbox_to_state(sandbox),
     }
-    graph = _build_graph()
+    graph = _build_graph(
+        work_runner=work_runner or _run_mock_work_session,
+        test_runner=test_runner or _run_mock_test_session,
+    )
     try:
         return graph.invoke(initial_state)
     finally:
@@ -68,11 +108,11 @@ def run_segment_graph(
         )
 
 
-def _build_graph():
+def _build_graph(*, work_runner: WorkRunner, test_runner: TestRunner):
     workflow = StateGraph(GraphState)
     workflow.add_node("orchestrator", _orchestrator_node)
-    workflow.add_node("work", _work_node)
-    workflow.add_node("test", _test_node)
+    workflow.add_node("work", _make_work_node(work_runner))
+    workflow.add_node("test", _make_test_node(test_runner))
     workflow.add_edge(START, "orchestrator")
     workflow.add_edge("orchestrator", "work")
     workflow.add_edge("work", "test")
@@ -102,66 +142,49 @@ def _orchestrator_node(state: GraphState) -> GraphState:
     )
 
 
-def _work_node(state: GraphState) -> GraphState:
-    def run() -> GraphState:
-        step = state["step"]
-        sandbox = state["sandbox"]
-        command = run_observed(
-            "git rev-parse --show-toplevel",
+def _make_work_node(work_runner: WorkRunner):
+    def _work_node(state: GraphState) -> GraphState:
+        def run() -> GraphState:
+            step = state["step"]
+            sandbox = state["sandbox"]
+            work_input = WorkSessionInput(
+                step_id=step["id"],
+                segment_id=step["segment_id"],
+                sandbox_path=sandbox["worktree_path"],
+                branch_name=sandbox["branch_name"],
+                run_id=state["run_id"],
+                events_path=state["events_path"],
+            )
+            return {"work_result": work_runner(work_input)}
+
+        return observe_step(
+            run,
+            actor="work",
+            step_name="work",
             segment_id=state["segment_id"],
             run_id=state["run_id"],
-            cwd=sandbox["worktree_path"],
             path=state["events_path"],
         )
-        if command.exit_code != 0:
-            raise RuntimeError(command.stderr.strip() or "mock work command failed")
-        return {
-            "work_result": {
-                "step_id": step["id"],
-                "summary": "mock work completed",
-                "sandbox_path": sandbox["worktree_path"],
-                "branch_name": sandbox["branch_name"],
-                "observed_top_level": command.stdout.strip(),
-                "diff": (
-                    f"fake diff for {step['segment_id']}\n"
-                    "--- a/src/backend/routes/materials.py\n"
-                    "+++ b/src/backend/routes/materials.py\n"
-                    "@@ mock @@\n"
-                    "- old line\n"
-                    "+ new line\n"
-                ),
-                "files_touched": [],
-            }
-        }
 
-    return observe_step(
-        run,
-        actor="work",
-        step_name="work",
-        segment_id=state["segment_id"],
-        run_id=state["run_id"],
-        path=state["events_path"],
-    )
+    return _work_node
 
 
-def _test_node(state: GraphState) -> GraphState:
-    def run() -> GraphState:
-        return {
-            "test_result": {
-                "passed": True,
-                "summary": "mock tests passed",
-                "evidence": "fixed-pass mock",
-            }
-        }
+def _make_test_node(test_runner: TestRunner):
+    def _test_node(state: GraphState) -> GraphState:
+        def run() -> GraphState:
+            test_input = _load_test_session_input(Path(state["contract_path"]))
+            return {"test_result": test_runner(test_input)}
 
-    return observe_step(
-        run,
-        actor="test",
-        step_name="test",
-        segment_id=state["segment_id"],
-        run_id=state["run_id"],
-        path=state["events_path"],
-    )
+        return observe_step(
+            run,
+            actor="test",
+            step_name="test",
+            segment_id=state["segment_id"],
+            run_id=state["run_id"],
+            path=state["events_path"],
+        )
+
+    return _test_node
 
 
 def _extract_segment_id(contract_path: Path) -> str:
@@ -193,6 +216,67 @@ def _load_segment_contract(contract_path: Path) -> dict[str, Any]:
     parsed["covers_req"] = top_level_fields["covers_req"]
 
     return parsed
+
+
+def _load_test_session_input(contract_path: Path) -> TestSessionInput:
+    content = contract_path.read_text(encoding="utf-8")
+    acceptance = [
+        AcceptanceCriterion(id=criterion_id.strip(), text=text.strip())
+        for criterion_id, text in _ACCEPTANCE_ENTRY_PATTERN.findall(content)
+    ]
+    if not acceptance:
+        raise ValueError(f"acceptance not found in contract: {contract_path}")
+
+    match = _SEQUENCE_DIAGRAM_PATTERN.search(content)
+    if match is None:
+        raise ValueError(f"preview.sequence_diagram not found in contract: {contract_path}")
+
+    sequence_diagram = "\n".join(
+        line[4:] if line.startswith("    ") else line
+        for line in match.group("body").splitlines()
+    )
+
+    return TestSessionInput(
+        acceptance=acceptance,
+        sequence_diagram=sequence_diagram,
+    )
+
+
+def _run_mock_work_session(work_input: WorkSessionInput) -> dict[str, Any]:
+    command = run_observed(
+        "git rev-parse --show-toplevel",
+        segment_id=work_input.segment_id,
+        run_id=work_input.run_id,
+        cwd=work_input.sandbox_path,
+        path=work_input.events_path,
+    )
+    if command.exit_code != 0:
+        raise RuntimeError(command.stderr.strip() or "mock work command failed")
+
+    return {
+        "step_id": work_input.step_id,
+        "summary": "mock work completed",
+        "sandbox_path": work_input.sandbox_path,
+        "branch_name": work_input.branch_name,
+        "observed_top_level": command.stdout.strip(),
+        "diff": (
+            f"fake diff for {work_input.segment_id}\n"
+            "--- a/src/backend/routes/materials.py\n"
+            "+++ b/src/backend/routes/materials.py\n"
+            "@@ mock @@\n"
+            "- old line\n"
+            "+ new line\n"
+        ),
+        "files_touched": [],
+    }
+
+
+def _run_mock_test_session(_: TestSessionInput) -> dict[str, Any]:
+    return {
+        "passed": True,
+        "summary": "mock tests passed",
+        "evidence": "fixed-pass mock",
+    }
 
 
 def _sandbox_to_state(sandbox: Sandbox) -> dict[str, str]:

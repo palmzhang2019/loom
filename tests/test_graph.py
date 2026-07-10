@@ -4,12 +4,15 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import json
 from dataclasses import asdict
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from loom.graph import run_segment_graph
+from loom.harness import CommandResult
 from loom.view import load_event_rows, render_html_document
 
 
@@ -35,6 +38,7 @@ class P3ALangGraphTests(unittest.TestCase):
                 events_path=events_path,
                 execution_repo_path=execution_repo,
                 worktree_root=worktree_root,
+                work_runner=_mock_work_session,
             )
 
             rows, invalid_lines = load_event_rows(
@@ -77,11 +81,62 @@ class P3ALangGraphTests(unittest.TestCase):
                     ],
                     "segment_id": "MAT-REQ-001/S1",
                     "covers_req": "MAT-REQ-001",
+                    "title": "后端移除来源标签的路由与删除逻辑",
+                    "acceptance": [
+                        {
+                            "id": "MAT-REQ-001/S1/AC1",
+                            "text": '存在一个后端路由,接收"移除某个来源标签关联"的请求',
+                        },
+                        {
+                            "id": "MAT-REQ-001/S1/AC2",
+                            "text": "删除的是【标签与素材的关联记录】,不是标签本身",
+                        },
+                        {
+                            "id": "MAT-REQ-001/S1/AC3",
+                            "text": "删除成功后,该素材的来源标签列表中不再包含被移除项",
+                        },
+                        {
+                            "id": "MAT-REQ-001/S1/AC4",
+                            "text": "对不存在的关联发起删除,返回明确失败/无操作,不报 500",
+                        },
+                    ],
+                    "anti_scope": [
+                        {
+                            "text": "前端移除入口与确认弹窗",
+                            "kind": "defer",
+                            "defer_to": "MAT-REQ-001/S2",
+                        },
+                        {
+                            "text": "删除后页面重定向与反馈",
+                            "kind": "defer",
+                            "defer_to": "MAT-REQ-001/S3",
+                        },
+                        {
+                            "text": "批量移除",
+                            "kind": "out_of_req",
+                        },
+                        {
+                            "text": "标签本身的增删(只删关联)",
+                            "kind": "out_of_req",
+                        },
+                    ],
+                    "scope_paths": [
+                        "src/backend/routes/",
+                        "src/backend/models/",
+                    ],
+                    "sequence_diagram": "\n".join(
+                        [
+                            "请求 -> 路由: 移除关联(material_id, tag_id)",
+                            "路由 -> 模型: 删除关联记录",
+                            "模型 --> 路由: 删除结果",
+                            "路由 --> 请求: 成功/失败响应",
+                        ]
+                    ),
                 },
             )
             self.assertFalse((worktree_root / "MAT-REQ-001-S1").exists())
             command_runs = [row for row in rows if row["type"] == "command_run"]
-            self.assertGreaterEqual(len(command_runs), 4)
+            self.assertEqual(len(command_runs), 3)
             work_finished = next(
                 row
                 for row in rows
@@ -113,6 +168,7 @@ class P3ALangGraphTests(unittest.TestCase):
                 events_path=events_path,
                 execution_repo_path=execution_repo,
                 worktree_root=worktree_root,
+                work_runner=_mock_work_session,
             )
 
             rows, invalid_lines = load_event_rows(
@@ -227,6 +283,145 @@ class P3ALangGraphTests(unittest.TestCase):
             self.assertFalse(hasattr(received_input, "files_touched"))
             self.assertNotIn(nonce, str(asdict(received_input)))
 
+    def test_work_node_spawns_codex_exec_and_records_observed_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            events_path = Path(tmpdir) / "events.jsonl"
+            execution_repo = Path(tmpdir) / "lingua-web"
+            execution_repo.mkdir()
+            _init_main_repo(execution_repo)
+            worktree_root = Path(tmpdir) / "loom-worktrees"
+            contract_path = (
+                Path(__file__).resolve().parents[1]
+                / "specs"
+                / "MAT-REQ-001"
+                / "segments"
+                / "S1.yaml"
+            )
+
+            def fake_run_observed(cmd, *, segment_id, run_id, cwd=None, path=None):
+                self.assertIn("codex exec", cmd)
+                self.assertIn("--sandbox workspace-write", cmd)
+                self.assertEqual(segment_id, "MAT-REQ-001/S1")
+                self.assertEqual(run_id, "run-graph-work-real-001")
+                self.assertEqual(Path(path), events_path)
+                self.assertTrue(str(cwd).endswith("loom-worktrees/MAT-REQ-001-S1"))
+                self.assertIn("--output-schema", cmd)
+                self.assertIn("--output-last-message", cmd)
+                self.assertIn("后端移除来源标签的路由与删除逻辑", Path(_extract_redirect_path(cmd, "<")).read_text(encoding="utf-8"))
+
+                declaration_path = Path(_extract_flag_path(cmd, "--output-last-message"))
+                declaration_path.parent.mkdir(parents=True, exist_ok=True)
+                declaration_path.write_text(
+                    json.dumps(
+                        {
+                            "summary": "implemented route and model changes",
+                            "claimed_changed_files": [
+                                "src/backend/routes/materials.py",
+                                "src/backend/models/materials.py",
+                            ],
+                            "notes": ["single-pass implement"],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+                target = Path(cwd) / "src" / "backend" / "routes"
+                target.mkdir(parents=True, exist_ok=True)
+                (target / "materials.py").write_text("implemented\n", encoding="utf-8")
+
+                return CommandResult(
+                    exit_code=0,
+                    stdout="codex ok\n",
+                    stderr="",
+                    duration_seconds=0.25,
+                )
+
+            with patch("loom.graph.run_observed", side_effect=fake_run_observed):
+                state = run_segment_graph(
+                    contract_path=contract_path,
+                    run_id="run-graph-work-real-001",
+                    events_path=events_path,
+                    execution_repo_path=execution_repo,
+                    worktree_root=worktree_root,
+                )
+
+            self.assertEqual(state["work_result"]["exit_code"], 0)
+            self.assertEqual(state["work_result"]["status"], "succeeded")
+            self.assertEqual(
+                [item["path"] for item in state["work_result"]["observed_files_changed"]],
+                ["src/backend/routes/materials.py"],
+            )
+            self.assertEqual(state["work_result"]["failure_reasons"], [])
+            self.assertEqual(state["work_result"]["declaration"]["kind"], "agent_declaration")
+            self.assertTrue(Path(state["work_result"]["declaration"]["path"]).exists())
+
+            rows, _ = load_event_rows(
+                events_path,
+                run_id="run-graph-work-real-001",
+                segment_id="MAT-REQ-001/S1",
+            )
+            self.assertEqual(
+                [row["type"] for row in rows if row["actor"] == "harness"].count("files_changed"),
+                1,
+            )
+
+    def test_work_node_records_out_of_scope_change_without_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            events_path = Path(tmpdir) / "events.jsonl"
+            execution_repo = Path(tmpdir) / "lingua-web"
+            execution_repo.mkdir()
+            _init_main_repo(execution_repo)
+            worktree_root = Path(tmpdir) / "loom-worktrees"
+            contract_path = (
+                Path(__file__).resolve().parents[1]
+                / "specs"
+                / "MAT-REQ-001"
+                / "segments"
+                / "S1.yaml"
+            )
+
+            def fake_run_observed(cmd, *, segment_id, run_id, cwd=None, path=None):
+                declaration_path = Path(_extract_flag_path(cmd, "--output-last-message"))
+                declaration_path.parent.mkdir(parents=True, exist_ok=True)
+                declaration_path.write_text(
+                    json.dumps(
+                        {
+                            "summary": "changed wrong file",
+                            "claimed_changed_files": ["README.md"],
+                            "notes": ["out of scope on purpose"],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                (Path(cwd) / "README.md").write_text("changed\n", encoding="utf-8")
+                return CommandResult(
+                    exit_code=0,
+                    stdout="codex ok\n",
+                    stderr="",
+                    duration_seconds=0.25,
+                )
+
+            with patch("loom.graph.run_observed", side_effect=fake_run_observed):
+                state = run_segment_graph(
+                    contract_path=contract_path,
+                    run_id="run-graph-work-real-002",
+                    events_path=events_path,
+                    execution_repo_path=execution_repo,
+                    worktree_root=worktree_root,
+                )
+
+            self.assertEqual(state["work_result"]["exit_code"], 0)
+            self.assertEqual(state["work_result"]["status"], "failed")
+            self.assertEqual(
+                state["work_result"]["out_of_scope_paths"],
+                ["README.md"],
+            )
+            self.assertIn("out_of_scope_changes", state["work_result"]["failure_reasons"])
+            self.assertEqual(
+                [item["path"] for item in state["work_result"]["observed_files_changed"]],
+                ["README.md"],
+            )
+
 def _git(git_dir: Path, *args: str) -> str:
     completed = subprocess.run(
         ["git", *args],
@@ -245,6 +440,34 @@ def _init_main_repo(git_dir: Path) -> None:
     (git_dir / "README.md").write_text("baseline\n", encoding="utf-8")
     _git(git_dir, "add", "README.md")
     _git(git_dir, "commit", "-m", "baseline")
+
+
+def _mock_work_session(work_input) -> dict[str, object]:
+    return {
+        "step_id": work_input.step_id,
+        "summary": "mock work completed",
+        "sandbox_path": work_input.sandbox_path,
+        "branch_name": work_input.branch_name,
+        "observed_top_level": work_input.sandbox_path,
+        "diff": f"fake diff for {work_input.segment_id}",
+        "files_touched": [],
+    }
+
+
+def _extract_flag_path(cmd: str, flag: str) -> str:
+    import shlex
+
+    parts = shlex.split(cmd)
+    index = parts.index(flag)
+    return parts[index + 1]
+
+
+def _extract_redirect_path(cmd: str, operator: str) -> str:
+    import shlex
+
+    parts = shlex.split(cmd, posix=True)
+    index = parts.index(operator)
+    return parts[index + 1]
 
 
 if __name__ == "__main__":

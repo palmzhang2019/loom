@@ -73,7 +73,7 @@ def destroy_sandbox(
 ) -> None:
     if sandbox.worktree_path.exists():
         result = run_observed(
-            f"git worktree remove {quote(str(sandbox.worktree_path))}",
+            f"git worktree remove --force {quote(str(sandbox.worktree_path))}",
             segment_id=sandbox.segment_id,
             run_id=run_id,
             cwd=sandbox.repo_path,

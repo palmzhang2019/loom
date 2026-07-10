@@ -140,6 +140,28 @@ class HarnessTests(unittest.TestCase):
                 ["actual.txt"],
             )
 
+    def test_observe_files_changed_writes_to_requested_events_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            git_dir = Path(tmpdir) / "repo"
+            git_dir.mkdir()
+            _init_git_repo(git_dir)
+            target = git_dir / "tracked.txt"
+            target.write_text("before\n", encoding="utf-8")
+            _commit_all(git_dir, "baseline")
+            events_path = Path(tmpdir) / "custom-events.jsonl"
+
+            observe_files_changed(
+                lambda: target.write_text("after\n", encoding="utf-8"),
+                git_dir=git_dir,
+                segment_id="MAT-REQ-001/S1",
+                run_id="run-001",
+                path=events_path,
+            )
+
+            self.assertTrue(events_path.exists())
+            payload = events_path.read_text(encoding="utf-8")
+            self.assertIn("\"type\": \"files_changed\"", payload)
+
 
 if __name__ == "__main__":
     unittest.main()

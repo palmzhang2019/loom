@@ -82,6 +82,7 @@ def observe_files_changed(
     git_dir: Path | str,
     segment_id: str,
     run_id: str,
+    path: Path | str = DEFAULT_EVENTS_PATH,
 ) -> list[FileChange]:
     repo_dir = Path(git_dir)
     before = _capture_git_state(repo_dir)
@@ -109,7 +110,8 @@ def observe_files_changed(
                         for change in changes
                     ]
                 },
-            )
+            ),
+            path=path,
         )
 
     return changes

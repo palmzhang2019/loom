@@ -17,3 +17,8 @@
 ## 命名规约:产物不带 phase 编号
 - phase(P3a 等)是建造过程标记,不是产物功能名。带 phase 的命名会渗进文件名/类名/字符串/注释,清理如拔草根(p3a 追了三轮)。
 - 让 agent 按功能命名,不按 phase;验收时发现 phase 编号立即拦。
+
+## 契约 scope_paths 必须对齐执行平面真实结构
+- P3d-1 首跑真 codex 暴露:契约 scope_paths 写了 src/backend/(真空假设),lingua-web 实际是 app/。
+- Codex 自作主张改到等价路径 app/,被 harness 文件观测如实抓成 out_of_scope(anti-simulation 生效)。
+- 教训:写 segment 契约的 scope_paths / 路径假设前,须核对执行平面真实目录结构。

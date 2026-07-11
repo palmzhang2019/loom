@@ -6,11 +6,13 @@ import tempfile
 import unittest
 import json
 from dataclasses import asdict
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from loom.events import Event, append_event
 from loom.graph import run_segment_graph
 from loom.harness import CommandResult
 from loom.view import load_event_rows, render_html_document
@@ -39,6 +41,7 @@ class P3ALangGraphTests(unittest.TestCase):
                 execution_repo_path=execution_repo,
                 worktree_root=worktree_root,
                 work_runner=_mock_work_session,
+                test_runner=_mock_test_session,
             )
 
             rows, invalid_lines = load_event_rows(
@@ -85,15 +88,15 @@ class P3ALangGraphTests(unittest.TestCase):
                     "acceptance": [
                         {
                             "id": "MAT-REQ-001/S1/AC1",
-                            "text": '存在一个后端路由,接收"移除某个来源标签关联"的请求',
+                            "text": '在 app/routes/upload.py 中新增一个与现有 POST /materials/{material_id}/tag/add 对称的移除路由,接收"移除某个来源标签关联"的请求',
                         },
                         {
                             "id": "MAT-REQ-001/S1/AC2",
-                            "text": "删除的是【标签与素材的关联记录】,不是标签本身",
+                            "text": "删除的是 app/models.py 中 MaterialKnowledgeTagLink 的关联记录,不是 KnowledgeTag 标签本身",
                         },
                         {
                             "id": "MAT-REQ-001/S1/AC3",
-                            "text": "删除成功后,该素材的来源标签列表中不再包含被移除项",
+                            "text": "删除成功后,该素材详情页读取到的已挂载来源标签列表中不再包含被移除项",
                         },
                         {
                             "id": "MAT-REQ-001/S1/AC4",
@@ -116,27 +119,37 @@ class P3ALangGraphTests(unittest.TestCase):
                             "kind": "out_of_req",
                         },
                         {
-                            "text": "标签本身的增删(只删关联)",
+                            "text": "KnowledgeTag 标签本身的增删(只删 MaterialKnowledgeTagLink 关联)",
+                            "kind": "out_of_req",
+                        },
+                        {
+                            "text": "app/routes/knowledge.py 的 tag 过滤/反查 source tags 读路径(删关联后自然反映,S1 不主动碰)",
+                            "kind": "out_of_req",
+                        },
+                        {
+                            "text": "app/services/tagging.py 的标签规范化/绑定逻辑(S1 只做解绑,不改绑定侧)",
                             "kind": "out_of_req",
                         },
                     ],
                     "scope_paths": [
-                        "src/backend/routes/",
-                        "src/backend/models/",
+                        "app/routes/upload.py",
+                        "app/models.py",
                     ],
                     "sequence_diagram": "\n".join(
                         [
-                            "请求 -> 路由: 移除关联(material_id, tag_id)",
-                            "路由 -> 模型: 删除关联记录",
-                            "模型 --> 路由: 删除结果",
-                            "路由 --> 请求: 成功/失败响应",
+                            "请求 -> upload路由: 移除关联(material_id, tag_id)",
+                            "upload路由 -> models(MaterialKnowledgeTagLink): 删除该关联记录",
+                            "models --> upload路由: 删除结果(成功/无该关联)",
+                            "upload路由 --> 请求: 成功/失败响应",
                         ]
                     ),
                 },
             )
             self.assertFalse((worktree_root / "MAT-REQ-001-S1").exists())
             command_runs = [row for row in rows if row["type"] == "command_run"]
-            self.assertEqual(len(command_runs), 3)
+            self.assertEqual(len(command_runs), 4)
+            self.assertEqual(command_runs[1]["payload"]["cmd"], "uv sync --extra dev")
+            self.assertEqual(command_runs[1]["payload"]["exit_code"], 0)
             work_finished = next(
                 row
                 for row in rows
@@ -169,6 +182,7 @@ class P3ALangGraphTests(unittest.TestCase):
                 execution_repo_path=execution_repo,
                 worktree_root=worktree_root,
                 work_runner=_mock_work_session,
+                test_runner=_mock_test_session,
             )
 
             rows, invalid_lines = load_event_rows(
@@ -244,22 +258,22 @@ class P3ALangGraphTests(unittest.TestCase):
             received_input = captured_test_inputs[0]
             self.assertEqual(
                 list(asdict(received_input).keys()),
-                ["acceptance", "sequence_diagram"],
+                ["acceptance", "sequence_diagram", "test_selectors"],
             )
             self.assertEqual(
                 asdict(received_input)["acceptance"],
                 [
                     {
                         "id": "MAT-REQ-001/S1/AC1",
-                        "text": '存在一个后端路由,接收"移除某个来源标签关联"的请求',
+                        "text": '在 app/routes/upload.py 中新增一个与现有 POST /materials/{material_id}/tag/add 对称的移除路由,接收"移除某个来源标签关联"的请求',
                     },
                     {
                         "id": "MAT-REQ-001/S1/AC2",
-                        "text": "删除的是【标签与素材的关联记录】,不是标签本身",
+                        "text": "删除的是 app/models.py 中 MaterialKnowledgeTagLink 的关联记录,不是 KnowledgeTag 标签本身",
                     },
                     {
                         "id": "MAT-REQ-001/S1/AC3",
-                        "text": "删除成功后,该素材的来源标签列表中不再包含被移除项",
+                        "text": "删除成功后,该素材详情页读取到的已挂载来源标签列表中不再包含被移除项",
                     },
                     {
                         "id": "MAT-REQ-001/S1/AC4",
@@ -271,17 +285,217 @@ class P3ALangGraphTests(unittest.TestCase):
                 received_input.sequence_diagram,
                 "\n".join(
                     [
-                        "请求 -> 路由: 移除关联(material_id, tag_id)",
-                        "路由 -> 模型: 删除关联记录",
-                        "模型 --> 路由: 删除结果",
-                        "路由 --> 请求: 成功/失败响应",
+                        "请求 -> upload路由: 移除关联(material_id, tag_id)",
+                        "upload路由 -> models(MaterialKnowledgeTagLink): 删除该关联记录",
+                        "models --> upload路由: 删除结果(成功/无该关联)",
+                        "upload路由 --> 请求: 成功/失败响应",
                     ]
                 ),
             )
+            self.assertEqual(received_input.test_selectors, [])
             self.assertFalse(hasattr(received_input, "diff"))
             self.assertFalse(hasattr(received_input, "summary"))
             self.assertFalse(hasattr(received_input, "files_touched"))
             self.assertNotIn(nonce, str(asdict(received_input)))
+
+    def test_run_segment_graph_stops_before_work_when_uv_sync_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            events_path = Path(tmpdir) / "events.jsonl"
+            execution_repo = Path(tmpdir) / "lingua-web"
+            execution_repo.mkdir()
+            _init_main_repo(execution_repo)
+            worktree_root = Path(tmpdir) / "loom-worktrees"
+            contract_path = (
+                Path(__file__).resolve().parents[1]
+                / "specs"
+                / "MAT-REQ-001"
+                / "segments"
+                / "S1.yaml"
+            )
+
+            from loom import sandbox as sandbox_module
+
+            original_run_observed = sandbox_module.run_observed
+
+            def fake_run_observed(cmd, *, segment_id, run_id, cwd=None, path=None):
+                if cmd == "uv sync --extra dev":
+                    result = CommandResult(
+                        exit_code=2,
+                        stdout="",
+                        stderr="sync failed\n",
+                        duration_seconds=0.2,
+                    )
+                    append_event(
+                        Event(
+                            ts=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                            segment_id=segment_id,
+                            run_id=run_id,
+                            actor="harness",
+                            type="command_run",
+                            payload={
+                                "cmd": cmd,
+                                "cwd": str(cwd) if cwd is not None else None,
+                                "exit_code": result.exit_code,
+                                "stdout": result.stdout,
+                                "stderr": result.stderr,
+                                "duration_seconds": result.duration_seconds,
+                            },
+                        ),
+                        path=path,
+                    )
+                    return result
+                return original_run_observed(
+                    cmd,
+                    segment_id=segment_id,
+                    run_id=run_id,
+                    cwd=cwd,
+                    path=path,
+                )
+
+            with patch("loom.sandbox.run_observed", side_effect=fake_run_observed):
+                with self.assertRaisesRegex(RuntimeError, "uv sync failed"):
+                    run_segment_graph(
+                        contract_path=contract_path,
+                        run_id="run-graph-sync-fail-001",
+                        events_path=events_path,
+                        execution_repo_path=execution_repo,
+                        worktree_root=worktree_root,
+                        work_runner=_mock_work_session,
+                        test_runner=_mock_test_session,
+                    )
+
+            rows, invalid_lines = load_event_rows(
+                events_path,
+                run_id="run-graph-sync-fail-001",
+                segment_id="MAT-REQ-001/S1",
+            )
+            self.assertEqual(invalid_lines, [])
+            self.assertEqual([row["actor"] for row in rows if row["actor"] != "harness"], [])
+            sandbox_path = worktree_root / "MAT-REQ-001-S1"
+            self.assertEqual(
+                [(row["payload"]["cmd"], row["payload"]["exit_code"]) for row in rows if row["type"] == "command_run"],
+                [
+                    (
+                        f"git worktree add -b loom/MAT-REQ-001-S1 {sandbox_path} main",
+                        0,
+                    ),
+                    ("uv sync --extra dev", 2),
+                    (
+                        f"git worktree remove --force {sandbox_path}",
+                        0,
+                    ),
+                    ("git branch -D loom/MAT-REQ-001-S1", 0),
+                ],
+            )
+            self.assertFalse(sandbox_path.exists())
+
+    def test_test_node_runs_pytest_in_same_sandbox_and_uses_observed_exit_code(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            events_path = Path(tmpdir) / "events.jsonl"
+            execution_repo = Path(tmpdir) / "lingua-web"
+            execution_repo.mkdir()
+            _init_main_repo(execution_repo)
+            worktree_root = Path(tmpdir) / "loom-worktrees"
+            contract_path = (
+                Path(__file__).resolve().parents[1]
+                / "specs"
+                / "MAT-REQ-001"
+                / "segments"
+                / "S1.yaml"
+            )
+            selectors = [
+                "tests/test_s3t_tagging.py",
+                "tests/test_s4bb_material_tag_wiring.py",
+            ]
+            observed_commands: list[tuple[str, str | None]] = []
+
+            def fake_run_observed(cmd, *, segment_id, run_id, cwd=None, path=None):
+                observed_commands.append((cmd, None if cwd is None else str(cwd)))
+                self.assertEqual(segment_id, "MAT-REQ-001/S1")
+                self.assertEqual(run_id, "run-graph-test-real-001")
+                self.assertEqual(Path(path), events_path)
+                self.assertTrue(str(cwd).endswith("loom-worktrees/MAT-REQ-001-S1"))
+                self.assertEqual(
+                    cmd,
+                    "uv run pytest tests/test_s3t_tagging.py tests/test_s4bb_material_tag_wiring.py",
+                )
+                result = CommandResult(
+                    exit_code=5,
+                    stdout="pretend-green-output\n",
+                    stderr="real failure\n",
+                    duration_seconds=1.5,
+                )
+                append_event(
+                    Event(
+                        ts=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                        segment_id=segment_id,
+                        run_id=run_id,
+                        actor="harness",
+                        type="command_run",
+                        payload={
+                            "cmd": cmd,
+                            "cwd": str(cwd),
+                            "exit_code": result.exit_code,
+                            "stdout": result.stdout,
+                            "stderr": result.stderr,
+                            "duration_seconds": result.duration_seconds,
+                        },
+                    ),
+                    path=path,
+                )
+                return result
+
+            with patch("loom.graph.run_observed", side_effect=fake_run_observed):
+                state = run_segment_graph(
+                    contract_path=contract_path,
+                    run_id="run-graph-test-real-001",
+                    events_path=events_path,
+                    execution_repo_path=execution_repo,
+                    worktree_root=worktree_root,
+                    work_runner=_mock_work_session,
+                    test_selectors=selectors,
+                )
+
+            self.assertFalse(state["test_result"]["passed"])
+            self.assertEqual(state["test_result"]["exit_code"], 5)
+            self.assertEqual(state["test_result"]["test_selectors"], selectors)
+            self.assertTrue(Path(state["test_result"]["stdout_path"]).exists())
+            self.assertTrue(Path(state["test_result"]["stderr_path"]).exists())
+            self.assertEqual(
+                observed_commands,
+                [
+                    (
+                        "uv run pytest tests/test_s3t_tagging.py tests/test_s4bb_material_tag_wiring.py",
+                        str(worktree_root / "MAT-REQ-001-S1"),
+                    ),
+                ],
+            )
+
+            rows, _ = load_event_rows(
+                events_path,
+                run_id="run-graph-test-real-001",
+                segment_id="MAT-REQ-001/S1",
+            )
+            command_rows = [row for row in rows if row["type"] == "command_run"]
+            self.assertEqual(
+                [(row["payload"]["cmd"], row["payload"]["exit_code"]) for row in command_rows],
+                [
+                    (
+                        f"git worktree add -b loom/MAT-REQ-001-S1 {worktree_root / 'MAT-REQ-001-S1'} main",
+                        0,
+                    ),
+                    ("uv sync --extra dev", 0),
+                    (
+                        "uv run pytest tests/test_s3t_tagging.py tests/test_s4bb_material_tag_wiring.py",
+                        5,
+                    ),
+                    (
+                        f"git worktree remove --force {worktree_root / 'MAT-REQ-001-S1'}",
+                        0,
+                    ),
+                    ("git branch -D loom/MAT-REQ-001-S1", 0),
+                ],
+            )
 
     def test_work_node_spawns_codex_exec_and_records_observed_changes(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -316,8 +530,8 @@ class P3ALangGraphTests(unittest.TestCase):
                         {
                             "summary": "implemented route and model changes",
                             "claimed_changed_files": [
-                                "src/backend/routes/materials.py",
-                                "src/backend/models/materials.py",
+                                "app/routes/upload.py",
+                                "app/models.py",
                             ],
                             "notes": ["single-pass implement"],
                         }
@@ -325,9 +539,9 @@ class P3ALangGraphTests(unittest.TestCase):
                     encoding="utf-8",
                 )
 
-                target = Path(cwd) / "src" / "backend" / "routes"
+                target = Path(cwd) / "app" / "routes"
                 target.mkdir(parents=True, exist_ok=True)
-                (target / "materials.py").write_text("implemented\n", encoding="utf-8")
+                (target / "upload.py").write_text("implemented\n", encoding="utf-8")
 
                 return CommandResult(
                     exit_code=0,
@@ -343,13 +557,14 @@ class P3ALangGraphTests(unittest.TestCase):
                     events_path=events_path,
                     execution_repo_path=execution_repo,
                     worktree_root=worktree_root,
+                    test_runner=_mock_test_session,
                 )
 
             self.assertEqual(state["work_result"]["exit_code"], 0)
             self.assertEqual(state["work_result"]["status"], "succeeded")
             self.assertEqual(
                 [item["path"] for item in state["work_result"]["observed_files_changed"]],
-                ["src/backend/routes/materials.py"],
+                ["app/routes/upload.py"],
             )
             self.assertEqual(state["work_result"]["failure_reasons"], [])
             self.assertEqual(state["work_result"]["declaration"]["kind"], "agent_declaration")
@@ -408,6 +623,7 @@ class P3ALangGraphTests(unittest.TestCase):
                     events_path=events_path,
                     execution_repo_path=execution_repo,
                     worktree_root=worktree_root,
+                    test_runner=_mock_test_session,
                 )
 
             self.assertEqual(state["work_result"]["exit_code"], 0)
@@ -438,7 +654,30 @@ def _init_main_repo(git_dir: Path) -> None:
     _git(git_dir, "config", "user.name", "Loom Tests")
     _git(git_dir, "config", "user.email", "loom-tests@example.com")
     (git_dir / "README.md").write_text("baseline\n", encoding="utf-8")
+    (git_dir / "pyproject.toml").write_text(
+        "\n".join(
+            [
+                "[project]",
+                'name = "loom-graph-tests"',
+                'version = "0.1.0"',
+                "requires-python = \">=3.11\"",
+                "",
+                "[project.optional-dependencies]",
+                "dev = []",
+                "",
+                "[tool.uv]",
+                "package = false",
+                "",
+                "[build-system]",
+                'requires = ["hatchling"]',
+                'build-backend = "hatchling.build"',
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
     _git(git_dir, "add", "README.md")
+    _git(git_dir, "add", "pyproject.toml")
     _git(git_dir, "commit", "-m", "baseline")
 
 
@@ -451,6 +690,15 @@ def _mock_work_session(work_input) -> dict[str, object]:
         "observed_top_level": work_input.sandbox_path,
         "diff": f"fake diff for {work_input.segment_id}",
         "files_touched": [],
+    }
+
+
+def _mock_test_session(test_input) -> dict[str, object]:
+    return {
+        "passed": True,
+        "summary": "mock tests passed",
+        "evidence": "fixed-pass mock",
+        "test_selectors": list(test_input.test_selectors),
     }
 
 

@@ -26,6 +26,7 @@ class GraphState(TypedDict, total=False):
     events_path: str
     run_id: str
     segment_id: str
+    test_selectors: list[str]
     sandbox: dict[str, str]
     segment: dict[str, Any]
     step: dict[str, Any]
@@ -70,6 +71,7 @@ class AcceptanceCriterion:
 class TestSessionInput:
     acceptance: list[AcceptanceCriterion]
     sequence_diagram: str
+    test_selectors: list[str]
 
 
 WorkRunner = Callable[[WorkSessionInput], dict[str, Any]]
@@ -80,6 +82,7 @@ def run_segment_graph(
     *,
     contract_path: Path | str,
     run_id: str,
+    test_selectors: list[str] | tuple[str, ...] = (),
     events_path: Path | str = DEFAULT_EVENTS_PATH,
     execution_repo_path: Path | str = DEFAULT_EXECUTION_REPO_PATH,
     worktree_root: Path | str = DEFAULT_WORKTREE_ROOT,
@@ -100,11 +103,12 @@ def run_segment_graph(
         "events_path": str(events_path),
         "run_id": run_id,
         "segment_id": segment_id,
+        "test_selectors": list(test_selectors),
         "sandbox": _sandbox_to_state(sandbox),
     }
     graph = _build_graph(
         work_runner=work_runner or _run_codex_work_session,
-        test_runner=test_runner or _run_mock_test_session,
+        test_runner=test_runner,
     )
     try:
         return graph.invoke(initial_state)
@@ -116,7 +120,7 @@ def run_segment_graph(
         )
 
 
-def _build_graph(*, work_runner: WorkRunner, test_runner: TestRunner):
+def _build_graph(*, work_runner: WorkRunner, test_runner: TestRunner | None):
     workflow = StateGraph(GraphState)
     workflow.add_node("orchestrator", _orchestrator_node)
     workflow.add_node("work", _make_work_node(work_runner))
@@ -186,11 +190,24 @@ def _make_work_node(work_runner: WorkRunner):
     return _work_node
 
 
-def _make_test_node(test_runner: TestRunner):
+def _make_test_node(test_runner: TestRunner | None):
     def _test_node(state: GraphState) -> GraphState:
         def run() -> GraphState:
-            test_input = _load_test_session_input(Path(state["contract_path"]))
-            return {"test_result": test_runner(test_input)}
+            test_input = _load_test_session_input(
+                Path(state["contract_path"]),
+                test_selectors=state.get("test_selectors", []),
+            )
+            if test_runner is None:
+                test_result = _run_pytest_test_session(
+                    test_input,
+                    segment_id=state["segment_id"],
+                    sandbox_path=state["sandbox"]["worktree_path"],
+                    run_id=state["run_id"],
+                    events_path=state["events_path"],
+                )
+            else:
+                test_result = test_runner(test_input)
+            return {"test_result": test_result}
 
         return observe_step(
             run,
@@ -219,7 +236,11 @@ def _load_segment_contract(contract_path: Path) -> dict[str, Any]:
     return parsed
 
 
-def _load_test_session_input(contract_path: Path) -> TestSessionInput:
+def _load_test_session_input(
+    contract_path: Path,
+    *,
+    test_selectors: list[str],
+) -> TestSessionInput:
     parsed = _parse_segment_contract(contract_path)
     acceptance = [
         AcceptanceCriterion(id=item["id"], text=item["text"])
@@ -229,6 +250,7 @@ def _load_test_session_input(contract_path: Path) -> TestSessionInput:
     return TestSessionInput(
         acceptance=acceptance,
         sequence_diagram=parsed["sequence_diagram"],
+        test_selectors=list(test_selectors),
     )
 
 
@@ -321,11 +343,42 @@ def _run_codex_work_session(work_input: WorkSessionInput) -> dict[str, Any]:
     }
 
 
-def _run_mock_test_session(_: TestSessionInput) -> dict[str, Any]:
+def _run_pytest_test_session(
+    test_input: TestSessionInput,
+    *,
+    segment_id: str,
+    sandbox_path: str,
+    run_id: str,
+    events_path: str,
+) -> dict[str, Any]:
+    if not test_input.test_selectors:
+        raise ValueError("test_selectors are required for real test execution")
+
+    runtime_dir = _test_runtime_dir(
+        segment_id=segment_id,
+        run_id=run_id,
+        events_path=events_path,
+    )
+    stdout_path = runtime_dir / "pytest-stdout.txt"
+    stderr_path = runtime_dir / "pytest-stderr.txt"
+    selectors = " ".join(quote(selector) for selector in test_input.test_selectors)
+    command_result = run_observed(
+        f"uv run pytest {selectors}",
+        segment_id=segment_id,
+        run_id=run_id,
+        cwd=sandbox_path,
+        path=events_path,
+    )
+    stdout_path.write_text(command_result.stdout, encoding="utf-8")
+    stderr_path.write_text(command_result.stderr, encoding="utf-8")
     return {
-        "passed": True,
-        "summary": "mock tests passed",
-        "evidence": "fixed-pass mock",
+        "passed": command_result.exit_code == 0,
+        "summary": "pytest test run completed",
+        "exit_code": command_result.exit_code,
+        "stdout_path": str(stdout_path),
+        "stderr_path": str(stderr_path),
+        "sandbox_path": sandbox_path,
+        "test_selectors": list(test_input.test_selectors),
     }
 
 
@@ -425,8 +478,26 @@ def _split_mapping_line(line: str) -> tuple[str, str]:
 
 
 def _work_runtime_dir(work_input: WorkSessionInput) -> Path:
-    segment_variant = _segment_variant(work_input.segment_id)
-    runtime_dir = Path(work_input.events_path).resolve().parent / "runs" / work_input.run_id / segment_variant / "work"
+    return _runtime_dir(
+        segment_id=work_input.segment_id,
+        run_id=work_input.run_id,
+        events_path=work_input.events_path,
+        step_name="work",
+    )
+
+
+def _test_runtime_dir(*, segment_id: str, run_id: str, events_path: str) -> Path:
+    return _runtime_dir(
+        segment_id=segment_id,
+        run_id=run_id,
+        events_path=events_path,
+        step_name="test",
+    )
+
+
+def _runtime_dir(*, segment_id: str, run_id: str, events_path: str, step_name: str) -> Path:
+    segment_variant = _segment_variant(segment_id)
+    runtime_dir = Path(events_path).resolve().parent / "runs" / run_id / segment_variant / step_name
     runtime_dir.mkdir(parents=True, exist_ok=True)
     return runtime_dir
 

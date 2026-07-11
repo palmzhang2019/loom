@@ -62,6 +62,26 @@ def create_sandbox(
     if result.exit_code != 0:
         raise RuntimeError(result.stderr.strip() or "git worktree add failed")
 
+    sync_result = run_observed(
+        "uv sync --extra dev",
+        segment_id=segment_id,
+        run_id=run_id,
+        cwd=sandbox.worktree_path,
+        path=events_path,
+    )
+    if sync_result.exit_code != 0:
+        sync_detail = sync_result.stderr.strip() or "non-zero exit code"
+        sync_error = RuntimeError(f"uv sync failed: {sync_detail}")
+        try:
+            destroy_sandbox(
+                sandbox,
+                run_id=run_id,
+                events_path=events_path,
+            )
+        except RuntimeError as cleanup_error:
+            raise RuntimeError(f"{sync_error}; cleanup failed: {cleanup_error}") from sync_error
+        raise sync_error
+
     return sandbox
 
 

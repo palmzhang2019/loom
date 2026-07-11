@@ -22,3 +22,13 @@
 - P3d-1 首跑真 codex 暴露:契约 scope_paths 写了 src/backend/(真空假设),lingua-web 实际是 app/。
 - Codex 自作主张改到等价路径 app/,被 harness 文件观测如实抓成 out_of_scope(anti-simulation 生效)。
 - 教训:写 segment 契约的 scope_paths / 路径假设前,须核对执行平面真实目录结构。
+
+## P3d-1 认知:succeeded ≠ 功能正确
+- work_result "succeeded" 仅表示 exit 0 且改动在 scope 内(harness 观测),不表示代码功能正确。
+- P3d-1 阶段 test 仍是 mock;功能正确性无机制保证,勿把 succeeded 当"代码可用"。
+- worktree 跑完即销毁,agent 写的代码不保留——保留/测试/合入是 P3d-2/P3d-3/P4 的事。
+
+## sandbox 环境准备(P3d-2 发现)
+- git worktree 只复制代码不带 .venv;fresh worktree 直接跑 pytest 会因缺依赖 collection error(exit 2)。
+- 修法:sandbox 创建后经 harness 观测执行 uv sync --extra dev(pytest 在 optional-dependencies.dev,裸 uv sync 不装 extras)。再进 work/test。
+- 成本:每次开 sandbox 都 sync 一遍(uv 有缓存,通常可接受);嫌慢再优化,现在不做。

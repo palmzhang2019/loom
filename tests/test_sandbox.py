@@ -122,7 +122,7 @@ class SandboxTests(unittest.TestCase):
 
             original_run_observed = sandbox_module.run_observed
 
-            def fake_run_observed(cmd, *, segment_id, run_id, cwd=None, path=None):
+            def fake_run_observed(cmd, *, segment_id, run_id, cwd=None, path=None, payload=None):
                 if cmd == "uv sync --extra dev":
                     result = CommandResult(
                         exit_code=3,

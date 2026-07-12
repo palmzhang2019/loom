@@ -32,3 +32,7 @@
 - git worktree 只复制代码不带 .venv;fresh worktree 直接跑 pytest 会因缺依赖 collection error(exit 2)。
 - 修法:sandbox 创建后经 harness 观测执行 uv sync --extra dev(pytest 在 optional-dependencies.dev,裸 uv sync 不装 extras)。再进 work/test。
 - 成本:每次开 sandbox 都 sync 一遍(uv 有缓存,通常可接受);嫌慢再优化,现在不做。
+
+## run_id 唯一性(P3d-3 收尾确立)
+- run_id 在同一 events log 中一次性使用;复用会使按 run_id 派生的视图混合多次执行(P3d-3 真实演示曾因此误判"双开 sandbox")。
+- 现由确定性闸强制:启动前检查 events log,重复 run_id 直接拒绝。

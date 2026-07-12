@@ -36,6 +36,7 @@ def run_observed(
     run_id: str,
     cwd: Path | str | None = None,
     path: Path | str = DEFAULT_EVENTS_PATH,
+    payload: dict[str, object] | None = None,
 ) -> CommandResult:
     started_at = time.monotonic()
     completed = subprocess.run(
@@ -68,6 +69,7 @@ def run_observed(
                 "stdout": result.stdout,
                 "stderr": result.stderr,
                 "duration_seconds": result.duration_seconds,
+                **(payload or {}),
             },
         )
         ,
@@ -83,6 +85,7 @@ def observe_files_changed(
     segment_id: str,
     run_id: str,
     path: Path | str = DEFAULT_EVENTS_PATH,
+    payload: dict[str, object] | None = None,
 ) -> list[FileChange]:
     repo_dir = Path(git_dir)
     before = _capture_git_state(repo_dir)
@@ -106,9 +109,10 @@ def observe_files_changed(
                             "change_type": change.change_type,
                             "before_hash": change.before_hash,
                             "after_hash": change.after_hash,
-                        }
+                            }
                         for change in changes
-                    ]
+                    ],
+                    **(payload or {}),
                 },
             ),
             path=path,
@@ -125,6 +129,7 @@ def observe_step(
     segment_id: str,
     run_id: str,
     path: Path | str = DEFAULT_EVENTS_PATH,
+    payload: dict[str, object] | None = None,
 ) -> T:
     append_event(
         Event(
@@ -133,7 +138,7 @@ def observe_step(
             run_id=run_id,
             actor=actor,
             type="step_started",
-            payload={"step": step_name},
+            payload={"step": step_name, **(payload or {})},
         ),
         path=path,
     )
@@ -145,7 +150,7 @@ def observe_step(
             run_id=run_id,
             actor=actor,
             type="step_finished",
-            payload={"step": step_name, "result": result},
+            payload={"step": step_name, **(payload or {}), "result": result},
         ),
         path=path,
     )

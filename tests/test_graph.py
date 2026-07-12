@@ -148,6 +148,12 @@ class P3ALangGraphTests(unittest.TestCase):
             self.assertFalse((worktree_root / "MAT-REQ-001-S1").exists())
             command_runs = [row for row in rows if row["type"] == "command_run"]
             self.assertEqual(len(command_runs), 4)
+            self.assertEqual(
+                [row["payload"]["cmd"] for row in command_runs].count(
+                    f"git worktree add -b loom/MAT-REQ-001-S1 {worktree_root / 'MAT-REQ-001-S1'} main"
+                ),
+                1,
+            )
             self.assertEqual(command_runs[1]["payload"]["cmd"], "uv sync --extra dev")
             self.assertEqual(command_runs[1]["payload"]["exit_code"], 0)
             work_finished = next(
@@ -204,6 +210,59 @@ class P3ALangGraphTests(unittest.TestCase):
             self.assertIn("step_started", html)
             self.assertIn("step_finished", html)
             self.assertIn("MAT-REQ-001/S1", html)
+
+    def test_run_segment_graph_rejects_duplicate_run_id_before_second_sandbox_create(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            events_path = Path(tmpdir) / "events.jsonl"
+            execution_repo = Path(tmpdir) / "lingua-web"
+            execution_repo.mkdir()
+            _init_main_repo(execution_repo)
+            worktree_root = Path(tmpdir) / "loom-worktrees"
+            contract_path = (
+                Path(__file__).resolve().parents[1]
+                / "specs"
+                / "MAT-REQ-001"
+                / "segments"
+                / "S1.yaml"
+            )
+
+            run_segment_graph(
+                contract_path=contract_path,
+                run_id="run-graph-dup-001",
+                events_path=events_path,
+                execution_repo_path=execution_repo,
+                worktree_root=worktree_root,
+                work_runner=_mock_work_session,
+                test_runner=_mock_test_session,
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "run_id already exists"):
+                run_segment_graph(
+                    contract_path=contract_path,
+                    run_id="run-graph-dup-001",
+                    events_path=events_path,
+                    execution_repo_path=execution_repo,
+                    worktree_root=worktree_root,
+                    work_runner=_mock_work_session,
+                    test_runner=_mock_test_session,
+                )
+
+            rows, _ = load_event_rows(
+                events_path,
+                run_id="run-graph-dup-001",
+                segment_id="MAT-REQ-001/S1",
+            )
+            self.assertEqual(
+                [
+                    row["payload"]["cmd"]
+                    for row in rows
+                    if row["type"] == "command_run"
+                    and row["payload"]["cmd"].startswith("git worktree add ")
+                ],
+                [
+                    f"git worktree add -b loom/MAT-REQ-001-S1 {worktree_root / 'MAT-REQ-001-S1'} main",
+                ],
+            )
 
     def test_test_session_receives_only_contract_spec_and_not_work_nonce(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -317,7 +376,7 @@ class P3ALangGraphTests(unittest.TestCase):
 
             original_run_observed = sandbox_module.run_observed
 
-            def fake_run_observed(cmd, *, segment_id, run_id, cwd=None, path=None):
+            def fake_run_observed(cmd, *, segment_id, run_id, cwd=None, path=None, payload=None):
                 if cmd == "uv sync --extra dev":
                     result = CommandResult(
                         exit_code=2,
@@ -389,6 +448,303 @@ class P3ALangGraphTests(unittest.TestCase):
             )
             self.assertFalse(sandbox_path.exists())
 
+    def test_run_segment_graph_stops_after_first_green_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            events_path = Path(tmpdir) / "events.jsonl"
+            execution_repo = Path(tmpdir) / "lingua-web"
+            execution_repo.mkdir()
+            _init_main_repo(execution_repo)
+            worktree_root = Path(tmpdir) / "loom-worktrees"
+            contract_path = (
+                Path(__file__).resolve().parents[1]
+                / "specs"
+                / "MAT-REQ-001"
+                / "segments"
+                / "S1.yaml"
+            )
+            work_inputs = []
+            test_inputs = []
+
+            def work_runner(work_input) -> dict[str, object]:
+                work_inputs.append(work_input)
+                return {
+                    "step_id": work_input.step_id,
+                    "status": "succeeded",
+                    "summary": "initial implement succeeded",
+                    "sandbox_path": work_input.sandbox_path,
+                    "branch_name": work_input.branch_name,
+                    "observed_files_changed": [],
+                    "failure_reasons": [],
+                }
+
+            def test_runner(test_input) -> dict[str, object]:
+                test_inputs.append(test_input)
+                return _mock_test_attempt_result(
+                    base_dir=Path(tmpdir),
+                    attempt=len(test_inputs),
+                    passed=True,
+                    stdout="all green\n",
+                    stderr="",
+                )
+
+            state = run_segment_graph(
+                contract_path=contract_path,
+                run_id="run-graph-cycle-green-001",
+                events_path=events_path,
+                execution_repo_path=execution_repo,
+                worktree_root=worktree_root,
+                work_runner=work_runner,
+                test_runner=test_runner,
+            )
+
+            self.assertEqual(state["status"], "passed")
+            self.assertEqual(state["attempts"], 1)
+            self.assertEqual(len(work_inputs), 1)
+            self.assertEqual(len(test_inputs), 1)
+            self.assertEqual(work_inputs[0].attempt_number, 1)
+            self.assertEqual(work_inputs[0].mode, "implement")
+            self.assertIsNone(work_inputs[0].previous_test_stdout)
+            self.assertIsNone(work_inputs[0].previous_test_stderr)
+
+    def test_run_segment_graph_retries_until_third_attempt_passes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            events_path = Path(tmpdir) / "events.jsonl"
+            execution_repo = Path(tmpdir) / "lingua-web"
+            execution_repo.mkdir()
+            _init_main_repo(execution_repo)
+            worktree_root = Path(tmpdir) / "loom-worktrees"
+            contract_path = (
+                Path(__file__).resolve().parents[1]
+                / "specs"
+                / "MAT-REQ-001"
+                / "segments"
+                / "S1.yaml"
+            )
+            work_inputs = []
+            failure_texts = [
+                "attempt-1 pytest failure\n",
+                "attempt-2 pytest failure\n",
+            ]
+
+            def work_runner(work_input) -> dict[str, object]:
+                work_inputs.append(work_input)
+                return {
+                    "step_id": work_input.step_id,
+                    "status": "succeeded",
+                    "summary": f"{work_input.mode} attempt {work_input.attempt_number}",
+                    "sandbox_path": work_input.sandbox_path,
+                    "branch_name": work_input.branch_name,
+                    "observed_files_changed": [
+                        {
+                            "path": "app/routes/upload.py",
+                            "change_type": "modified",
+                            "before_hash": f"before-{work_input.attempt_number}",
+                            "after_hash": f"after-{work_input.attempt_number}",
+                        }
+                    ],
+                    "failure_reasons": [],
+                }
+
+            test_attempt = {"value": 0}
+
+            def test_runner(test_input) -> dict[str, object]:
+                test_attempt["value"] += 1
+                attempt = test_attempt["value"]
+                if attempt < 3:
+                    return _mock_test_attempt_result(
+                        base_dir=Path(tmpdir),
+                        attempt=attempt,
+                        passed=False,
+                        stdout=f"attempt {attempt} stdout\n",
+                        stderr=failure_texts[attempt - 1],
+                    )
+                return _mock_test_attempt_result(
+                    base_dir=Path(tmpdir),
+                    attempt=attempt,
+                    passed=True,
+                    stdout="fixed and green\n",
+                    stderr="",
+                )
+
+            state = run_segment_graph(
+                contract_path=contract_path,
+                run_id="run-graph-cycle-third-green-001",
+                events_path=events_path,
+                execution_repo_path=execution_repo,
+                worktree_root=worktree_root,
+                work_runner=work_runner,
+                test_runner=test_runner,
+            )
+
+            self.assertEqual(state["status"], "passed")
+            self.assertEqual(state["attempts"], 3)
+            self.assertEqual(len(work_inputs), 3)
+            self.assertEqual(work_inputs[0].mode, "implement")
+            self.assertEqual(work_inputs[1].mode, "fix")
+            self.assertEqual(work_inputs[2].mode, "fix")
+            self.assertEqual(work_inputs[1].previous_test_stderr, failure_texts[0])
+            self.assertEqual(work_inputs[2].previous_test_stderr, failure_texts[1])
+            self.assertEqual(
+                work_inputs[1].previous_observed_files_changed,
+                [
+                    {
+                        "path": "app/routes/upload.py",
+                        "change_type": "modified",
+                        "before_hash": "before-1",
+                        "after_hash": "after-1",
+                    }
+                ],
+            )
+
+    def test_run_segment_graph_stops_after_four_failed_attempts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            events_path = Path(tmpdir) / "events.jsonl"
+            execution_repo = Path(tmpdir) / "lingua-web"
+            execution_repo.mkdir()
+            _init_main_repo(execution_repo)
+            worktree_root = Path(tmpdir) / "loom-worktrees"
+            contract_path = (
+                Path(__file__).resolve().parents[1]
+                / "specs"
+                / "MAT-REQ-001"
+                / "segments"
+                / "S1.yaml"
+            )
+            work_attempts = []
+            test_attempts = {"value": 0}
+
+            def work_runner(work_input) -> dict[str, object]:
+                work_attempts.append(work_input.attempt_number)
+                return {
+                    "step_id": work_input.step_id,
+                    "status": "succeeded",
+                    "summary": f"attempt {work_input.attempt_number}",
+                    "sandbox_path": work_input.sandbox_path,
+                    "branch_name": work_input.branch_name,
+                    "observed_files_changed": [],
+                    "failure_reasons": [],
+                }
+
+            def test_runner(test_input) -> dict[str, object]:
+                test_attempts["value"] += 1
+                attempt = test_attempts["value"]
+                return _mock_test_attempt_result(
+                    base_dir=Path(tmpdir),
+                    attempt=attempt,
+                    passed=False,
+                    stdout=f"attempt {attempt} stdout\n",
+                    stderr=f"attempt {attempt} stderr\n",
+                )
+
+            state = run_segment_graph(
+                contract_path=contract_path,
+                run_id="run-graph-cycle-hard-stop-001",
+                events_path=events_path,
+                execution_repo_path=execution_repo,
+                worktree_root=worktree_root,
+                work_runner=work_runner,
+                test_runner=test_runner,
+            )
+
+            self.assertEqual(state["status"], "failed")
+            self.assertEqual(state["attempts"], 4)
+            self.assertEqual(work_attempts, [1, 2, 3, 4])
+            self.assertEqual(test_attempts["value"], 4)
+            self.assertEqual(state["test_result"]["attempt_number"], 4)
+            self.assertTrue(state["test_result"]["stderr_path"].endswith("mock-test-attempt-4-stderr.txt"))
+
+    def test_fix_attempt_receives_previous_failure_output_while_test_input_stays_spec_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            events_path = Path(tmpdir) / "events.jsonl"
+            execution_repo = Path(tmpdir) / "lingua-web"
+            execution_repo.mkdir()
+            _init_main_repo(execution_repo)
+            worktree_root = Path(tmpdir) / "loom-worktrees"
+            contract_path = (
+                Path(__file__).resolve().parents[1]
+                / "specs"
+                / "MAT-REQ-001"
+                / "segments"
+                / "S1.yaml"
+            )
+            failure_nonce = "P3D3-FAILURE-NONCE"
+            observed_nonce = "P3D3-OBSERVED-NONCE"
+            work_inputs = []
+            captured_test_inputs = []
+
+            def work_runner(work_input) -> dict[str, object]:
+                work_inputs.append(work_input)
+                return {
+                    "step_id": work_input.step_id,
+                    "status": "succeeded",
+                    "summary": f"work attempt {work_input.attempt_number}",
+                    "sandbox_path": work_input.sandbox_path,
+                    "branch_name": work_input.branch_name,
+                    "observed_files_changed": [
+                        {
+                            "path": "app/routes/upload.py",
+                            "change_type": "modified",
+                            "before_hash": f"before-{work_input.attempt_number}",
+                            "after_hash": observed_nonce,
+                        }
+                    ],
+                    "failure_reasons": [],
+                }
+
+            def test_runner(test_input) -> dict[str, object]:
+                captured_test_inputs.append(test_input)
+                attempt = len(captured_test_inputs)
+                if attempt == 1:
+                    return _mock_test_attempt_result(
+                        base_dir=Path(tmpdir),
+                        attempt=attempt,
+                        passed=False,
+                        stdout=f"{failure_nonce} stdout\n",
+                        stderr=f"{failure_nonce} stderr\n",
+                    )
+                return _mock_test_attempt_result(
+                    base_dir=Path(tmpdir),
+                    attempt=attempt,
+                    passed=True,
+                    stdout="green\n",
+                    stderr="",
+                )
+
+            state = run_segment_graph(
+                contract_path=contract_path,
+                run_id="run-graph-cycle-fix-context-001",
+                events_path=events_path,
+                execution_repo_path=execution_repo,
+                worktree_root=worktree_root,
+                work_runner=work_runner,
+                test_runner=test_runner,
+            )
+
+            self.assertEqual(state["status"], "passed")
+            self.assertEqual(state["attempts"], 2)
+            self.assertEqual(len(work_inputs), 2)
+            self.assertEqual(work_inputs[1].mode, "fix")
+            self.assertIn(failure_nonce, work_inputs[1].previous_test_stdout or "")
+            self.assertIn(failure_nonce, work_inputs[1].previous_test_stderr or "")
+            self.assertEqual(
+                work_inputs[1].previous_observed_files_changed,
+                [
+                    {
+                        "path": "app/routes/upload.py",
+                        "change_type": "modified",
+                        "before_hash": "before-1",
+                        "after_hash": observed_nonce,
+                    }
+                ],
+            )
+            for test_input in captured_test_inputs:
+                self.assertEqual(
+                    list(asdict(test_input).keys()),
+                    ["acceptance", "sequence_diagram", "test_selectors"],
+                )
+                self.assertNotIn(failure_nonce, str(asdict(test_input)))
+                self.assertNotIn(observed_nonce, str(asdict(test_input)))
+
     def test_test_node_runs_pytest_in_same_sandbox_and_uses_observed_exit_code(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             events_path = Path(tmpdir) / "events.jsonl"
@@ -409,7 +765,7 @@ class P3ALangGraphTests(unittest.TestCase):
             ]
             observed_commands: list[tuple[str, str | None]] = []
 
-            def fake_run_observed(cmd, *, segment_id, run_id, cwd=None, path=None):
+            def fake_run_observed(cmd, *, segment_id, run_id, cwd=None, path=None, payload=None):
                 observed_commands.append((cmd, None if cwd is None else str(cwd)))
                 self.assertEqual(segment_id, "MAT-REQ-001/S1")
                 self.assertEqual(run_id, "run-graph-test-real-001")
@@ -456,6 +812,8 @@ class P3ALangGraphTests(unittest.TestCase):
                     test_selectors=selectors,
                 )
 
+            self.assertEqual(state["status"], "failed")
+            self.assertEqual(state["attempts"], 4)
             self.assertFalse(state["test_result"]["passed"])
             self.assertEqual(state["test_result"]["exit_code"], 5)
             self.assertEqual(state["test_result"]["test_selectors"], selectors)
@@ -464,6 +822,18 @@ class P3ALangGraphTests(unittest.TestCase):
             self.assertEqual(
                 observed_commands,
                 [
+                    (
+                        "uv run pytest tests/test_s3t_tagging.py tests/test_s4bb_material_tag_wiring.py",
+                        str(worktree_root / "MAT-REQ-001-S1"),
+                    ),
+                    (
+                        "uv run pytest tests/test_s3t_tagging.py tests/test_s4bb_material_tag_wiring.py",
+                        str(worktree_root / "MAT-REQ-001-S1"),
+                    ),
+                    (
+                        "uv run pytest tests/test_s3t_tagging.py tests/test_s4bb_material_tag_wiring.py",
+                        str(worktree_root / "MAT-REQ-001-S1"),
+                    ),
                     (
                         "uv run pytest tests/test_s3t_tagging.py tests/test_s4bb_material_tag_wiring.py",
                         str(worktree_root / "MAT-REQ-001-S1"),
@@ -485,6 +855,18 @@ class P3ALangGraphTests(unittest.TestCase):
                         0,
                     ),
                     ("uv sync --extra dev", 0),
+                    (
+                        "uv run pytest tests/test_s3t_tagging.py tests/test_s4bb_material_tag_wiring.py",
+                        5,
+                    ),
+                    (
+                        "uv run pytest tests/test_s3t_tagging.py tests/test_s4bb_material_tag_wiring.py",
+                        5,
+                    ),
+                    (
+                        "uv run pytest tests/test_s3t_tagging.py tests/test_s4bb_material_tag_wiring.py",
+                        5,
+                    ),
                     (
                         "uv run pytest tests/test_s3t_tagging.py tests/test_s4bb_material_tag_wiring.py",
                         5,
@@ -512,7 +894,7 @@ class P3ALangGraphTests(unittest.TestCase):
                 / "S1.yaml"
             )
 
-            def fake_run_observed(cmd, *, segment_id, run_id, cwd=None, path=None):
+            def fake_run_observed(cmd, *, segment_id, run_id, cwd=None, path=None, payload=None):
                 self.assertIn("codex exec", cmd)
                 self.assertIn("--sandbox workspace-write", cmd)
                 self.assertEqual(segment_id, "MAT-REQ-001/S1")
@@ -580,7 +962,7 @@ class P3ALangGraphTests(unittest.TestCase):
                 1,
             )
 
-    def test_work_node_records_out_of_scope_change_without_retry(self) -> None:
+    def test_work_node_records_out_of_scope_change_until_retry_limit(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             events_path = Path(tmpdir) / "events.jsonl"
             execution_repo = Path(tmpdir) / "lingua-web"
@@ -594,8 +976,10 @@ class P3ALangGraphTests(unittest.TestCase):
                 / "segments"
                 / "S1.yaml"
             )
+            attempts = {"value": 0}
 
-            def fake_run_observed(cmd, *, segment_id, run_id, cwd=None, path=None):
+            def fake_run_observed(cmd, *, segment_id, run_id, cwd=None, path=None, payload=None):
+                attempts["value"] += 1
                 declaration_path = Path(_extract_flag_path(cmd, "--output-last-message"))
                 declaration_path.parent.mkdir(parents=True, exist_ok=True)
                 declaration_path.write_text(
@@ -608,7 +992,7 @@ class P3ALangGraphTests(unittest.TestCase):
                     ),
                     encoding="utf-8",
                 )
-                (Path(cwd) / "README.md").write_text("changed\n", encoding="utf-8")
+                (Path(cwd) / "README.md").write_text(f"changed {attempts['value']}\n", encoding="utf-8")
                 return CommandResult(
                     exit_code=0,
                     stdout="codex ok\n",
@@ -626,6 +1010,8 @@ class P3ALangGraphTests(unittest.TestCase):
                     test_runner=_mock_test_session,
                 )
 
+            self.assertEqual(state["status"], "failed")
+            self.assertEqual(state["attempts"], 4)
             self.assertEqual(state["work_result"]["exit_code"], 0)
             self.assertEqual(state["work_result"]["status"], "failed")
             self.assertEqual(
@@ -637,6 +1023,7 @@ class P3ALangGraphTests(unittest.TestCase):
                 [item["path"] for item in state["work_result"]["observed_files_changed"]],
                 ["README.md"],
             )
+            self.assertEqual(len(state["work_attempts"]), 4)
 
 def _git(git_dir: Path, *args: str) -> str:
     completed = subprocess.run(
@@ -699,6 +1086,28 @@ def _mock_test_session(test_input) -> dict[str, object]:
         "summary": "mock tests passed",
         "evidence": "fixed-pass mock",
         "test_selectors": list(test_input.test_selectors),
+    }
+
+
+def _mock_test_attempt_result(
+    *,
+    base_dir: Path,
+    attempt: int,
+    passed: bool,
+    stdout: str,
+    stderr: str,
+) -> dict[str, object]:
+    stdout_path = base_dir / f"mock-test-attempt-{attempt}-stdout.txt"
+    stderr_path = base_dir / f"mock-test-attempt-{attempt}-stderr.txt"
+    stdout_path.write_text(stdout, encoding="utf-8")
+    stderr_path.write_text(stderr, encoding="utf-8")
+    return {
+        "passed": passed,
+        "summary": f"mock test attempt {attempt}",
+        "exit_code": 0 if passed else 1,
+        "stdout_path": str(stdout_path),
+        "stderr_path": str(stderr_path),
+        "test_selectors": [],
     }
 
 

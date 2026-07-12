@@ -27,11 +27,15 @@ class GraphState(TypedDict, total=False):
     run_id: str
     segment_id: str
     test_selectors: list[str]
+    attempts: int
+    status: str
     sandbox: dict[str, str]
     segment: dict[str, Any]
     step: dict[str, Any]
     work_result: dict[str, Any]
+    work_attempts: list[dict[str, Any]]
     test_result: dict[str, Any]
+    test_attempts: list[dict[str, Any]]
 
 
 _TOP_LEVEL_FIELD_PATTERN = re.compile(r"^(segment_id|covers_req|title):\s*(.+)$", re.MULTILINE)
@@ -44,6 +48,7 @@ _SEQUENCE_DIAGRAM_PATTERN = re.compile(
     r"^preview:\n\s+sequence_diagram:\s*\|\n(?P<body>(?:\s{4}.+\n?)*)",
     re.MULTILINE,
 )
+MAX_WORK_ATTEMPTS = 4
 
 
 @dataclass(frozen=True)
@@ -54,11 +59,21 @@ class WorkSessionInput:
     branch_name: str
     run_id: str
     events_path: str
+    attempt_number: int
+    max_attempts: int
+    mode: str
     title: str
     acceptance: list[AcceptanceCriterion]
     anti_scope: list[dict[str, str]]
     scope_paths: list[str]
     sequence_diagram: str
+    previous_observed_files_changed: list[dict[str, Any]]
+    previous_work_failure_reasons: list[str]
+    previous_test_exit_code: int | None
+    previous_test_stdout_path: str | None
+    previous_test_stderr_path: str | None
+    previous_test_stdout: str | None
+    previous_test_stderr: str | None
 
 
 @dataclass(frozen=True)
@@ -91,6 +106,11 @@ def run_segment_graph(
 ) -> GraphState:
     contract_file = Path(contract_path)
     segment_id = _extract_segment_id(contract_file)
+    _require_unused_run_id(
+        events_path=events_path,
+        run_id=run_id,
+        segment_id=segment_id,
+    )
     sandbox = create_sandbox(
         segment_id=segment_id,
         repo_path=execution_repo_path,
@@ -104,6 +124,10 @@ def run_segment_graph(
         "run_id": run_id,
         "segment_id": segment_id,
         "test_selectors": list(test_selectors),
+        "attempts": 0,
+        "status": "running",
+        "work_attempts": [],
+        "test_attempts": [],
         "sandbox": _sandbox_to_state(sandbox),
     }
     graph = _build_graph(
@@ -128,7 +152,14 @@ def _build_graph(*, work_runner: WorkRunner, test_runner: TestRunner | None):
     workflow.add_edge(START, "orchestrator")
     workflow.add_edge("orchestrator", "work")
     workflow.add_edge("work", "test")
-    workflow.add_edge("test", END)
+    workflow.add_conditional_edges(
+        "test",
+        _route_after_test,
+        {
+            "retry": "work",
+            "end": END,
+        },
+    )
     return workflow.compile()
 
 
@@ -137,6 +168,10 @@ def _orchestrator_node(state: GraphState) -> GraphState:
         segment = _load_segment_contract(Path(state["contract_path"]))
         return {
             "segment": segment,
+            "attempts": state.get("attempts", 0),
+            "status": state.get("status", "running"),
+            "work_attempts": list(state.get("work_attempts", [])),
+            "test_attempts": list(state.get("test_attempts", [])),
             "step": {
                 "id": f"{segment['segment_id']}/STEP-1",
                 "segment_id": segment["segment_id"],
@@ -156,10 +191,15 @@ def _orchestrator_node(state: GraphState) -> GraphState:
 
 def _make_work_node(work_runner: WorkRunner):
     def _work_node(state: GraphState) -> GraphState:
+        attempt_number = state.get("attempts", 0) + 1
+        mode = "implement" if attempt_number == 1 else "fix"
+
         def run() -> GraphState:
             step = state["step"]
             sandbox = state["sandbox"]
             segment = state["segment"]
+            previous_work_result = state.get("work_result", {})
+            previous_test_result = state.get("test_result", {})
             work_input = WorkSessionInput(
                 step_id=step["id"],
                 segment_id=step["segment_id"],
@@ -167,6 +207,9 @@ def _make_work_node(work_runner: WorkRunner):
                 branch_name=sandbox["branch_name"],
                 run_id=state["run_id"],
                 events_path=state["events_path"],
+                attempt_number=attempt_number,
+                max_attempts=MAX_WORK_ATTEMPTS,
+                mode=mode,
                 title=segment["title"],
                 acceptance=[
                     AcceptanceCriterion(id=item["id"], text=item["text"])
@@ -175,8 +218,20 @@ def _make_work_node(work_runner: WorkRunner):
                 anti_scope=list(segment["anti_scope"]),
                 scope_paths=list(segment["scope_paths"]),
                 sequence_diagram=segment["sequence_diagram"],
+                previous_observed_files_changed=list(previous_work_result.get("observed_files_changed", [])),
+                previous_work_failure_reasons=list(previous_work_result.get("failure_reasons", [])),
+                previous_test_exit_code=_optional_int(previous_test_result.get("exit_code")),
+                previous_test_stdout_path=_optional_str(previous_test_result.get("stdout_path")),
+                previous_test_stderr_path=_optional_str(previous_test_result.get("stderr_path")),
+                previous_test_stdout=_load_optional_text(previous_test_result.get("stdout_path")),
+                previous_test_stderr=_load_optional_text(previous_test_result.get("stderr_path")),
             )
-            return {"work_result": work_runner(work_input)}
+            work_result = _enrich_work_result(work_runner(work_input), work_input)
+            return {
+                "attempts": attempt_number,
+                "work_result": work_result,
+                "work_attempts": [*state.get("work_attempts", []), work_result],
+            }
 
         return observe_step(
             run,
@@ -185,6 +240,7 @@ def _make_work_node(work_runner: WorkRunner):
             segment_id=state["segment_id"],
             run_id=state["run_id"],
             path=state["events_path"],
+            payload={"attempt": attempt_number, "mode": mode},
         )
 
     return _work_node
@@ -192,6 +248,8 @@ def _make_work_node(work_runner: WorkRunner):
 
 def _make_test_node(test_runner: TestRunner | None):
     def _test_node(state: GraphState) -> GraphState:
+        attempt_number = state["attempts"]
+
         def run() -> GraphState:
             test_input = _load_test_session_input(
                 Path(state["contract_path"]),
@@ -204,10 +262,20 @@ def _make_test_node(test_runner: TestRunner | None):
                     sandbox_path=state["sandbox"]["worktree_path"],
                     run_id=state["run_id"],
                     events_path=state["events_path"],
+                    attempt_number=attempt_number,
                 )
             else:
-                test_result = test_runner(test_input)
-            return {"test_result": test_result}
+                test_result = _enrich_test_result(test_runner(test_input), attempt_number)
+            status = _status_after_test(
+                work_result=state["work_result"],
+                test_result=test_result,
+                attempts=attempt_number,
+            )
+            return {
+                "status": status,
+                "test_result": test_result,
+                "test_attempts": [*state.get("test_attempts", []), test_result],
+            }
 
         return observe_step(
             run,
@@ -216,9 +284,38 @@ def _make_test_node(test_runner: TestRunner | None):
             segment_id=state["segment_id"],
             run_id=state["run_id"],
             path=state["events_path"],
+            payload={"attempt": attempt_number},
         )
 
     return _test_node
+
+
+def _route_after_test(state: GraphState) -> str:
+    return "retry" if state.get("status") == "retrying" else "end"
+
+
+def _require_unused_run_id(*, events_path: Path | str, run_id: str, segment_id: str) -> None:
+    path = Path(events_path)
+    if not path.exists():
+        return
+
+    with path.open("r", encoding="utf-8") as handle:
+        for raw_line in handle:
+            if not raw_line.strip():
+                continue
+            try:
+                payload = json.loads(raw_line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            if payload.get("run_id") != run_id:
+                continue
+            existing_segment_id = str(payload.get("segment_id", ""))
+            raise RuntimeError(
+                f"run_id already exists in events log: {run_id}"
+                + (f" (segment_id={existing_segment_id})" if existing_segment_id else f" (expected segment_id={segment_id})")
+            )
 
 
 def _extract_segment_id(contract_path: Path) -> str:
@@ -283,6 +380,7 @@ def _run_codex_work_session(work_input: WorkSessionInput) -> dict[str, Any]:
             run_id=work_input.run_id,
             cwd=work_input.sandbox_path,
             path=work_input.events_path,
+            payload={"attempt": work_input.attempt_number, "mode": work_input.mode},
         )
         return command_result
 
@@ -292,6 +390,7 @@ def _run_codex_work_session(work_input: WorkSessionInput) -> dict[str, Any]:
         segment_id=work_input.segment_id,
         run_id=work_input.run_id,
         path=work_input.events_path,
+        payload={"attempt": work_input.attempt_number, "mode": work_input.mode},
     )
     if command_result is None:
         raise RuntimeError("codex exec did not produce a command result")
@@ -320,10 +419,13 @@ def _run_codex_work_session(work_input: WorkSessionInput) -> dict[str, Any]:
     return {
         "step_id": work_input.step_id,
         "status": "failed" if failure_reasons else "succeeded",
-        "summary": "codex exec implement attempt completed",
+        "summary": f"codex exec {work_input.mode} attempt completed",
         "sandbox_path": work_input.sandbox_path,
         "branch_name": work_input.branch_name,
+        "attempt_number": work_input.attempt_number,
+        "mode": work_input.mode,
         "exit_code": command_result.exit_code,
+        "artifact_dir": str(runtime_dir),
         "prompt_path": str(prompt_path),
         "output_schema_path": str(schema_path),
         "stdout_path": str(stdout_path),
@@ -350,6 +452,7 @@ def _run_pytest_test_session(
     sandbox_path: str,
     run_id: str,
     events_path: str,
+    attempt_number: int,
 ) -> dict[str, Any]:
     if not test_input.test_selectors:
         raise ValueError("test_selectors are required for real test execution")
@@ -358,6 +461,7 @@ def _run_pytest_test_session(
         segment_id=segment_id,
         run_id=run_id,
         events_path=events_path,
+        attempt_number=attempt_number,
     )
     stdout_path = runtime_dir / "pytest-stdout.txt"
     stderr_path = runtime_dir / "pytest-stderr.txt"
@@ -368,12 +472,14 @@ def _run_pytest_test_session(
         run_id=run_id,
         cwd=sandbox_path,
         path=events_path,
+        payload={"attempt": attempt_number},
     )
     stdout_path.write_text(command_result.stdout, encoding="utf-8")
     stderr_path.write_text(command_result.stderr, encoding="utf-8")
     return {
         "passed": command_result.exit_code == 0,
         "summary": "pytest test run completed",
+        "attempt_number": attempt_number,
         "exit_code": command_result.exit_code,
         "stdout_path": str(stdout_path),
         "stderr_path": str(stderr_path),
@@ -482,16 +588,16 @@ def _work_runtime_dir(work_input: WorkSessionInput) -> Path:
         segment_id=work_input.segment_id,
         run_id=work_input.run_id,
         events_path=work_input.events_path,
-        step_name="work",
+        step_name=f"work-attempt-{work_input.attempt_number}",
     )
 
 
-def _test_runtime_dir(*, segment_id: str, run_id: str, events_path: str) -> Path:
+def _test_runtime_dir(*, segment_id: str, run_id: str, events_path: str, attempt_number: int) -> Path:
     return _runtime_dir(
         segment_id=segment_id,
         run_id=run_id,
         events_path=events_path,
-        step_name="test",
+        step_name=f"test-attempt-{attempt_number}",
     )
 
 
@@ -513,9 +619,17 @@ def _build_work_prompt(work_input: WorkSessionInput) -> str:
         for item in work_input.anti_scope
     )
     scope_lines = "\n".join(f"- {path}" for path in work_input.scope_paths)
+    observed_changes_lines = "\n".join(
+        f"- {item['path']} ({item['change_type']})"
+        for item in work_input.previous_observed_files_changed
+    ) or "- none"
+    failure_reasons_lines = "\n".join(f"- {reason}" for reason in work_input.previous_work_failure_reasons) or "- none"
+    previous_stdout = work_input.previous_test_stdout or "(stdout unavailable)"
+    previous_stderr = work_input.previous_test_stderr or "(stderr unavailable)"
     return "\n".join(
         [
-            f"Implement segment {work_input.segment_id} in this repository.",
+            f"{work_input.mode.title()} segment {work_input.segment_id} in this repository.",
+            f"Attempt: {work_input.attempt_number} / {work_input.max_attempts}",
             "",
             "Contract:",
             f"Title: {work_input.title}",
@@ -528,8 +642,22 @@ def _build_work_prompt(work_input: WorkSessionInput) -> str:
             "Sequence diagram:",
             work_input.sequence_diagram,
             "",
+            "Fix context from the previous attempt:"
+            if work_input.mode == "fix"
+            else "No prior failure context for the initial implement attempt.",
+            "Observed sandbox changes (from harness files_changed):",
+            observed_changes_lines,
+            "Previous work failure reasons:",
+            failure_reasons_lines,
+            f"Previous pytest exit code: {work_input.previous_test_exit_code}"
+            if work_input.previous_test_exit_code is not None
+            else "Previous pytest exit code: unavailable",
+            "Previous pytest stdout:",
+            previous_stdout,
+            "Previous pytest stderr:",
+            previous_stderr,
+            "",
             "Constraints:",
-            "- Implement only once for this run.",
             "- Stay within the listed scope_paths.",
             "- Do not modify files outside scope_paths.",
             "- Return only JSON matching the provided output schema.",
@@ -575,6 +703,57 @@ def _load_declaration(declaration_path: Path) -> dict[str, Any]:
 
 def _is_in_scope(path: str, scope_paths: list[str]) -> bool:
     return any(path == prefix.rstrip("/") or path.startswith(prefix) for prefix in scope_paths)
+
+
+def _enrich_work_result(result: dict[str, Any], work_input: WorkSessionInput) -> dict[str, Any]:
+    payload = dict(result)
+    payload.setdefault("step_id", work_input.step_id)
+    payload.setdefault("sandbox_path", work_input.sandbox_path)
+    payload.setdefault("branch_name", work_input.branch_name)
+    payload.setdefault("status", "succeeded")
+    payload.setdefault("failure_reasons", [])
+    payload.setdefault("observed_files_changed", [])
+    payload["attempt_number"] = work_input.attempt_number
+    payload["mode"] = work_input.mode
+    return payload
+
+
+def _enrich_test_result(result: dict[str, Any], attempt_number: int) -> dict[str, Any]:
+    payload = dict(result)
+    payload.setdefault("passed", False)
+    payload.setdefault("test_selectors", [])
+    payload["attempt_number"] = attempt_number
+    return payload
+
+
+def _status_after_test(*, work_result: dict[str, Any], test_result: dict[str, Any], attempts: int) -> str:
+    work_succeeded = work_result.get("status", "succeeded") == "succeeded"
+    test_passed = bool(test_result.get("passed"))
+    if work_succeeded and test_passed:
+        return "passed"
+    if attempts >= MAX_WORK_ATTEMPTS:
+        return "failed"
+    return "retrying"
+
+
+def _load_optional_text(path_value: Any) -> str | None:
+    path_str = _optional_str(path_value)
+    if path_str is None:
+        return None
+    path = Path(path_str)
+    if not path.exists():
+        return None
+    return path.read_text(encoding="utf-8")
+
+
+def _optional_str(value: Any) -> str | None:
+    if isinstance(value, str) and value:
+        return value
+    return None
+
+
+def _optional_int(value: Any) -> int | None:
+    return value if isinstance(value, int) else None
 
 
 def _sandbox_to_state(sandbox: Sandbox) -> dict[str, str]:

@@ -36,3 +36,7 @@
 ## run_id 唯一性(P3d-3 收尾确立)
 - run_id 在同一 events log 中一次性使用;复用会使按 run_id 派生的视图混合多次执行(P3d-3 真实演示曾因此误判"双开 sandbox")。
 - 现由确定性闸强制:启动前检查 events log,重复 run_id 直接拒绝。
+
+## run_id 唯一性(P3d-3 收尾确立)
+- run_id 在同一 events log 中一次性使用;复用会使按 run_id 派生的视图混合多次执行(P3d-3 曾因此误判"双开 sandbox";实为一次失败run+一次成功run共用 run_id)。
+- 现由确定性闸强制:启动前检查 events log,重复 run_id 直接拒绝。

@@ -8,12 +8,13 @@ import json
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
+from textwrap import dedent
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from loom.events import Event, append_event
-from loom.graph import run_segment_graph
+from loom.graph import _load_segment_contract, run_segment_graph
 from loom.harness import CommandResult
 from loom.view import load_event_rows, render_html_document
 
@@ -134,6 +135,10 @@ class P3ALangGraphTests(unittest.TestCase):
                     "scope_paths": [
                         "app/routes/upload.py",
                         "app/models.py",
+                    ],
+                    "test_selectors": [
+                        "tests/test_s3t_tagging.py",
+                        "tests/test_s4bb_material_tag_wiring.py",
                     ],
                     "sequence_diagram": "\n".join(
                         [
@@ -394,7 +399,13 @@ class P3ALangGraphTests(unittest.TestCase):
                     ]
                 ),
             )
-            self.assertEqual(received_input.test_selectors, [])
+            self.assertEqual(
+                received_input.test_selectors,
+                [
+                    "tests/test_s3t_tagging.py",
+                    "tests/test_s4bb_material_tag_wiring.py",
+                ],
+            )
             self.assertFalse(hasattr(received_input, "diff"))
             self.assertFalse(hasattr(received_input, "summary"))
             self.assertFalse(hasattr(received_input, "files_touched"))
@@ -852,7 +863,6 @@ class P3ALangGraphTests(unittest.TestCase):
                     execution_repo_path=execution_repo,
                     worktree_root=worktree_root,
                     work_runner=_mock_work_session,
-                    test_selectors=selectors,
                 )
 
             self.assertEqual(state["status"], "failed")
@@ -921,6 +931,126 @@ class P3ALangGraphTests(unittest.TestCase):
                     ("git branch -D loom/MAT-REQ-001-S1", 0),
                 ],
             )
+
+    def test_empty_contract_test_selectors_skip_pytest_and_emit_harness_event(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            events_path = Path(tmpdir) / "events.jsonl"
+            execution_repo = Path(tmpdir) / "lingua-web"
+            execution_repo.mkdir()
+            _init_main_repo(execution_repo)
+            worktree_root = Path(tmpdir) / "loom-worktrees"
+            contract_path = Path(tmpdir) / "S-empty-tests.yaml"
+            contract_path.write_text(
+                dedent(
+                    """\
+                    segment_id: MAT-REQ-001/S9
+                    covers_req: MAT-REQ-001
+                    title: 空测试选择器契约
+                    acceptance:
+                      - id: MAT-REQ-001/S9/AC1
+                        text: 只验证空测试选择器会诚实跳过
+                    anti_scope:
+                      - text: 不做别的
+                        kind: out_of_req
+                    depends_on: []
+                    scope_paths:
+                      - app/routes/upload.py
+                    test_selectors: []
+                    preview:
+                      sequence_diagram: |
+                        请求 -> 路由: 执行
+                        路由 --> 请求: 完成
+                    """
+                ),
+                encoding="utf-8",
+            )
+
+            state = run_segment_graph(
+                contract_path=contract_path,
+                run_id="run-graph-test-skip-001",
+                events_path=events_path,
+                execution_repo_path=execution_repo,
+                worktree_root=worktree_root,
+                work_runner=_mock_work_session,
+            )
+
+            self.assertEqual(state["status"], "passed")
+            self.assertEqual(state["attempts"], 1)
+            self.assertEqual(
+                state["test_result"],
+                {
+                    "status": "skipped",
+                    "summary": "本 run 未跑测试(空 selectors)",
+                    "attempt_number": 1,
+                    "test_selectors": [],
+                },
+            )
+
+            rows, _ = load_event_rows(
+                events_path,
+                run_id="run-graph-test-skip-001",
+                segment_id="MAT-REQ-001/S9",
+            )
+            self.assertEqual(
+                [row["payload"]["cmd"] for row in rows if row["type"] == "command_run"],
+                [
+                    f"git worktree add -b loom/MAT-REQ-001-S9 {worktree_root / 'MAT-REQ-001-S9'} main",
+                    "uv sync --extra dev",
+                    f"git worktree remove --force {worktree_root / 'MAT-REQ-001-S9'}",
+                    "git branch -D loom/MAT-REQ-001-S9",
+                ],
+            )
+            skipped_rows = [
+                row
+                for row in rows
+                if row["actor"] == "harness" and row["type"] == "test_skipped"
+            ]
+            self.assertEqual(len(skipped_rows), 1)
+            self.assertEqual(skipped_rows[0]["segment_id"], "MAT-REQ-001/S9")
+            self.assertEqual(skipped_rows[0]["run_id"], "run-graph-test-skip-001")
+            self.assertEqual(
+                skipped_rows[0]["payload"],
+                {
+                    "attempt": 1,
+                    "summary": "本 run 未跑测试(空 selectors)",
+                    "test_selectors": [],
+                },
+            )
+
+    def test_load_segment_contract_rejects_test_selector_inside_scope_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            contract_path = Path(tmpdir) / "S-bad-tests.yaml"
+            contract_path.write_text(
+                dedent(
+                    """\
+                    segment_id: MAT-REQ-001/S10
+                    covers_req: MAT-REQ-001
+                    title: 非法测试范围重叠契约
+                    acceptance:
+                      - id: MAT-REQ-001/S10/AC1
+                        text: 契约加载时拒绝 scope 与测试重叠
+                    anti_scope:
+                      - text: 不做别的
+                        kind: out_of_req
+                    depends_on: []
+                    scope_paths:
+                      - tests/
+                    test_selectors:
+                      - tests/test_s3t_tagging.py
+                    preview:
+                      sequence_diagram: |
+                        请求 -> 路由: 执行
+                        路由 --> 请求: 完成
+                    """
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                ValueError,
+                r"test_selectors must not overlap scope_paths: tests/test_s3t_tagging.py",
+            ):
+                _load_segment_contract(contract_path)
 
     def test_work_node_spawns_codex_exec_and_records_observed_changes(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

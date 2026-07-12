@@ -3,13 +3,14 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from shlex import quote
 from typing import Any, Callable, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
-from .events import DEFAULT_EVENTS_PATH
+from .events import DEFAULT_EVENTS_PATH, Event, append_event
 from .harness import CommandResult, observe_files_changed, observe_step, run_observed
 from .sandbox import (
     DEFAULT_EXECUTION_REPO_PATH,
@@ -26,7 +27,6 @@ class GraphState(TypedDict, total=False):
     events_path: str
     run_id: str
     segment_id: str
-    test_selectors: list[str]
     attempts: int
     status: str
     sandbox: dict[str, str]
@@ -97,7 +97,6 @@ def run_segment_graph(
     *,
     contract_path: Path | str,
     run_id: str,
-    test_selectors: list[str] | tuple[str, ...] = (),
     events_path: Path | str = DEFAULT_EVENTS_PATH,
     execution_repo_path: Path | str = DEFAULT_EXECUTION_REPO_PATH,
     worktree_root: Path | str = DEFAULT_WORKTREE_ROOT,
@@ -123,7 +122,6 @@ def run_segment_graph(
         "events_path": str(events_path),
         "run_id": run_id,
         "segment_id": segment_id,
-        "test_selectors": list(test_selectors),
         "attempts": 0,
         "status": "running",
         "work_attempts": [],
@@ -251,10 +249,7 @@ def _make_test_node(test_runner: TestRunner | None):
         attempt_number = state["attempts"]
 
         def run() -> GraphState:
-            test_input = _load_test_session_input(
-                Path(state["contract_path"]),
-                test_selectors=state.get("test_selectors", []),
-            )
+            test_input = _load_test_session_input(state["segment"])
             if test_runner is None:
                 test_result = _run_pytest_test_session(
                     test_input,
@@ -334,20 +329,17 @@ def _load_segment_contract(contract_path: Path) -> dict[str, Any]:
 
 
 def _load_test_session_input(
-    contract_path: Path,
-    *,
-    test_selectors: list[str],
+    segment: dict[str, Any],
 ) -> TestSessionInput:
-    parsed = _parse_segment_contract(contract_path)
     acceptance = [
         AcceptanceCriterion(id=item["id"], text=item["text"])
-        for item in parsed["acceptance"]
+        for item in segment["acceptance"]
     ]
 
     return TestSessionInput(
         acceptance=acceptance,
-        sequence_diagram=parsed["sequence_diagram"],
-        test_selectors=list(test_selectors),
+        sequence_diagram=str(segment["sequence_diagram"]),
+        test_selectors=list(segment["test_selectors"]),
     )
 
 
@@ -455,7 +447,24 @@ def _run_pytest_test_session(
     attempt_number: int,
 ) -> dict[str, Any]:
     if not test_input.test_selectors:
-        raise ValueError("test_selectors are required for real test execution")
+        summary = "本 run 未跑测试(空 selectors)"
+        _append_harness_event(
+            segment_id=segment_id,
+            run_id=run_id,
+            events_path=events_path,
+            event_type="test_skipped",
+            payload={
+                "attempt": attempt_number,
+                "summary": summary,
+                "test_selectors": [],
+            },
+        )
+        return {
+            "status": "skipped",
+            "summary": summary,
+            "attempt_number": attempt_number,
+            "test_selectors": [],
+        }
 
     runtime_dir = _test_runtime_dir(
         segment_id=segment_id,
@@ -477,6 +486,7 @@ def _run_pytest_test_session(
     stdout_path.write_text(command_result.stdout, encoding="utf-8")
     stderr_path.write_text(command_result.stderr, encoding="utf-8")
     return {
+        "status": "passed" if command_result.exit_code == 0 else "failed",
         "passed": command_result.exit_code == 0,
         "summary": "pytest test run completed",
         "attempt_number": attempt_number,
@@ -513,6 +523,8 @@ def _parse_segment_contract(contract_path: Path) -> dict[str, Any]:
     scope_paths = _extract_block_scalars(content, header="scope_paths")
     if not scope_paths:
         raise ValueError(f"scope_paths not found in contract: {contract_path}")
+    test_selectors = _extract_test_selectors(content, contract_path)
+    _validate_test_selectors(scope_paths=scope_paths, test_selectors=test_selectors)
 
     return {
         "segment_id": top_level_fields["segment_id"],
@@ -521,6 +533,7 @@ def _parse_segment_contract(contract_path: Path) -> dict[str, Any]:
         "acceptance": acceptance,
         "anti_scope": anti_scope,
         "scope_paths": scope_paths,
+        "test_selectors": test_selectors,
         "sequence_diagram": sequence_diagram,
     }
 
@@ -573,9 +586,36 @@ def _extract_block_scalars(content: str, *, header: str) -> list[str]:
 def _find_header_line(lines: list[str], header: str) -> int | None:
     target = f"{header}:"
     for index, line in enumerate(lines):
-        if line == target:
+        if line.startswith(target):
             return index
     return None
+
+
+def _extract_test_selectors(content: str, contract_path: Path) -> list[str]:
+    lines = content.splitlines()
+    index = _find_header_line(lines, "test_selectors")
+    if index is None:
+        raise ValueError(f"test_selectors not found in contract: {contract_path}")
+
+    _, raw_value = lines[index].split(":", 1)
+    inline_value = raw_value.strip()
+    if inline_value == "[]":
+        return []
+    if inline_value:
+        raise ValueError(f"test_selectors must be a YAML list or []: {contract_path}")
+    return _extract_block_scalars(content, header="test_selectors")
+
+
+def _validate_test_selectors(*, scope_paths: list[str], test_selectors: list[str]) -> None:
+    overlapping = [
+        selector
+        for selector in test_selectors
+        if _is_in_scope(selector, scope_paths)
+    ]
+    if overlapping:
+        raise ValueError(
+            "test_selectors must not overlap scope_paths: " + ", ".join(overlapping)
+        )
 
 
 def _split_mapping_line(line: str) -> tuple[str, str]:
@@ -721,6 +761,7 @@ def _enrich_work_result(result: dict[str, Any], work_input: WorkSessionInput) ->
 def _enrich_test_result(result: dict[str, Any], attempt_number: int) -> dict[str, Any]:
     payload = dict(result)
     payload.setdefault("passed", False)
+    payload.setdefault("status", "passed" if payload.get("passed") else "failed")
     payload.setdefault("test_selectors", [])
     payload["attempt_number"] = attempt_number
     return payload
@@ -729,7 +770,8 @@ def _enrich_test_result(result: dict[str, Any], attempt_number: int) -> dict[str
 def _status_after_test(*, work_result: dict[str, Any], test_result: dict[str, Any], attempts: int) -> str:
     work_succeeded = work_result.get("status", "succeeded") == "succeeded"
     test_passed = bool(test_result.get("passed"))
-    if work_succeeded and test_passed:
+    test_skipped = test_result.get("status") == "skipped"
+    if work_succeeded and (test_passed or test_skipped):
         return "passed"
     if attempts >= MAX_WORK_ATTEMPTS:
         return "failed"
@@ -763,3 +805,28 @@ def _sandbox_to_state(sandbox: Sandbox) -> dict[str, str]:
         "branch_name": sandbox.branch_name,
         "base_branch": sandbox.base_branch,
     }
+
+
+def _append_harness_event(
+    *,
+    segment_id: str,
+    run_id: str,
+    events_path: Path | str,
+    event_type: str,
+    payload: dict[str, Any],
+) -> None:
+    append_event(
+        Event(
+            ts=_utc_now(),
+            segment_id=segment_id,
+            run_id=run_id,
+            actor="harness",
+            type=event_type,
+            payload=payload,
+        ),
+        path=events_path,
+    )
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")

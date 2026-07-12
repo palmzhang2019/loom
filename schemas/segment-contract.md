@@ -99,6 +99,22 @@ scope_paths:
   - src/backend/models/
 ```
 
+### test_selectors `(必填,允许空列表)`
+本 segment 该跑哪些现成测试(P3d-2/B2:跑 scope 相关的测试子集,由人指定,不让机器猜)。
+
+- **粒度:文件级**。列出 pytest 可用的测试文件路径(相对执行平面 repo 根),不做函数级(`::` 精确)——够用即可,函数级等真需要再加。
+- **必填但允许空列表**:字段必须存在(schema 完整性)。若本 segment 无合适的现成测试可跑,填 `[]`——这是一条有意义的信息("无现成测试"),不填不相关测试凑数(凑数是自欺,违背 anti-simulation)。
+  - 空列表时:test 节点诚实跳过,test_result 标记 `skipped`;系统不自动补 py_compile。"该 segment 无测试是否可接受"交由 P4 review 判断(review 本就查测试充分性)。
+- **与 scope_paths 的约束**:test_selectors 指向的测试文件**不得出现在 scope_paths 中**。scope_paths 只含实现文件(如 `app/`),测试文件(`tests/`)在其外——于是现有 scope 检查天然拦住 agent 改测试:agent 只能改实现(scope 内)让测试通过,不能改测试本身让它迎合实现(利益冲突,P3c 隔离的延续)。
+- **来源**:人在写契约时指定(与 acceptance 同属人的判断)。test 节点从契约读取,在 sandbox 内经 harness 观测执行 `uv run pytest <test_selectors>`,pass/fail 由观测的 exit_code 决定。
+
+```yaml
+test_selectors:
+  - tests/test_s3t_tagging.py
+  - tests/test_s4bb_material_tag_wiring.py
+# 无现成测试时:test_selectors: []
+```
+
 ### preview `(seq 图必填;html 条件必填)`
 **既是预览,也是验收靶子** —— P4 从代码反向生成图/html,与此比对,检测漂移。
 - `sequence_diagram` —— **每个 segment 必填**。任何 segment 都有交互时序(后端也有 `请求→路由→删关联→返回`),它是 test agent 的黑盒 oracle(照时序验,不看实现)。

@@ -29,6 +29,9 @@ depends_on: []
 scope_paths:
   - app/routes/upload.py
   - app/models.py
+test_selectors:
+  - tests/test_s3t_tagging.py
+  - tests/test_s4bb_material_tag_wiring.py
 preview:
   sequence_diagram: |
     请求 -> upload路由: 移除关联(material_id, tag_id)

@@ -50,3 +50,8 @@
   触发 "Extra dev not defined" 假象,一度误判为环境隔离/exit code 漏洞。
 - 实际:lingua-web main 上 uv sync --extra dev 真实成功(装 39 包,exit 0);0.22s 是 uv 缓存链接的正常速度。
 - 教训:验证 Loom 的执行环境时,须在真实执行平面(lingua-web)复现,否则验证脚本自身的 bug 会诬陷正确的系统。
+
+## P4 合入策略:先演习(B),不进真 main
+- P4 阶段人类合入闸先在安全目标(测试分支/不进 lingua-web 真 main)上跑通机制。
+- 切换到真合入(A)的条件:review/audit 报告经多次验证确实能让人看清"该不该合",人类对其判断建立信任后。
+- 理由:合入闸的价值在于"信任地按下";机制未验证前不赌真项目 main。

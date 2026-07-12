@@ -4,6 +4,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from dataclasses import asdict
 from pathlib import Path
 from unittest.mock import patch
 
@@ -11,7 +12,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from loom.events import Event, append_event
 from loom.harness import CommandResult
-from loom.sandbox import create_sandbox, destroy_sandbox
+from loom.sandbox import (
+    create_sandbox,
+    delete_retained_branch,
+    destroy_sandbox,
+    list_retained_branches,
+)
 from loom.view import load_event_rows
 
 
@@ -95,14 +101,11 @@ class SandboxTests(unittest.TestCase):
             )
 
             self.assertFalse(sandbox.worktree_path.exists())
-            self.assertNotIn(
-                "loom/MAT-REQ-001-S1",
-                _git(repo_dir, "branch", "--list"),
-            )
+            self.assertIn("loom/MAT-REQ-001-S1", _git(repo_dir, "branch", "--list"))
 
             rows, _ = load_event_rows(events_path, run_id="run-sandbox-001")
             command_runs = [row for row in rows if row["type"] == "command_run"]
-            self.assertGreaterEqual(len(command_runs), 4)
+            self.assertGreaterEqual(len(command_runs), 3)
             self.assertEqual(command_runs[1]["payload"]["cmd"], "uv sync --extra dev")
             self.assertEqual(
                 command_runs[1]["payload"]["cwd"],
@@ -187,6 +190,59 @@ class SandboxTests(unittest.TestCase):
                     (f"git worktree remove --force {sandbox_path}", 0),
                     ("git branch -D loom/MAT-REQ-001-S1", 0),
                 ],
+            )
+
+    def test_list_and_delete_retained_branches_only_touch_loom_prefix(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_dir = Path(tmpdir) / "lingua-web"
+            repo_dir.mkdir()
+            _init_main_repo(repo_dir)
+            events_path = Path(tmpdir) / "events.jsonl"
+
+            _git(repo_dir, "branch", "loom/MAT-REQ-001-S1")
+            _git(repo_dir, "branch", "loom/MAT-REQ-001-S2")
+            _git(repo_dir, "branch", "feature/not-loom")
+
+            append_event(
+                Event(
+                    ts="2026-07-12T00:00:00Z",
+                    segment_id="MAT-REQ-001/S1",
+                    run_id="run-retained-001",
+                    actor="harness",
+                    type="artifact_retained",
+                    payload={"branch_name": "loom/MAT-REQ-001-S1", "status": "passed"},
+                ),
+                path=events_path,
+            )
+            append_event(
+                Event(
+                    ts="2026-07-12T00:01:00Z",
+                    segment_id="MAT-REQ-001/S2",
+                    run_id="run-retained-002",
+                    actor="harness",
+                    type="artifact_retained",
+                    payload={"branch_name": "loom/MAT-REQ-001-S2", "status": "failed"},
+                ),
+                path=events_path,
+            )
+
+            retained = list_retained_branches(repo_path=repo_dir, events_path=events_path)
+            self.assertEqual(
+                [asdict(item) for item in retained],
+                [
+                    {"branch_name": "loom/MAT-REQ-001-S1", "status": "passed"},
+                    {"branch_name": "loom/MAT-REQ-001-S2", "status": "failed"},
+                ],
+            )
+
+            delete_retained_branch(repo_path=repo_dir, branch_name="loom/MAT-REQ-001-S1")
+
+            self.assertNotIn("loom/MAT-REQ-001-S1", _git(repo_dir, "branch", "--list"))
+            self.assertIn("loom/MAT-REQ-001-S2", _git(repo_dir, "branch", "--list"))
+            self.assertIn("feature/not-loom", _git(repo_dir, "branch", "--list"))
+            self.assertEqual(
+                [asdict(item) for item in list_retained_branches(repo_path=repo_dir, events_path=events_path)],
+                [{"branch_name": "loom/MAT-REQ-001-S2", "status": "failed"}],
             )
 
 

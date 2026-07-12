@@ -18,6 +18,7 @@ from .sandbox import (
     Sandbox,
     create_sandbox,
     destroy_sandbox,
+    retain_sandbox_artifact,
     _segment_variant,
 )
 
@@ -132,14 +133,25 @@ def run_segment_graph(
         work_runner=work_runner or _run_codex_work_session,
         test_runner=test_runner,
     )
+    final_state: GraphState | None = None
     try:
-        return graph.invoke(initial_state)
+        final_state = graph.invoke(initial_state)
+        return final_state
     finally:
-        destroy_sandbox(
-            sandbox,
-            run_id=run_id,
-            events_path=events_path,
-        )
+        if final_state is not None:
+            retain_sandbox_artifact(
+                sandbox,
+                run_id=run_id,
+                events_path=events_path,
+                status=str(final_state["status"]),
+            )
+        else:
+            destroy_sandbox(
+                sandbox,
+                run_id=run_id,
+                events_path=events_path,
+                delete_branch=True,
+            )
 
 
 def _build_graph(*, work_runner: WorkRunner, test_runner: TestRunner | None):

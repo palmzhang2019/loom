@@ -152,7 +152,7 @@ class P3ALangGraphTests(unittest.TestCase):
             )
             self.assertFalse((worktree_root / "MAT-REQ-001-S1").exists())
             command_runs = [row for row in rows if row["type"] == "command_run"]
-            self.assertEqual(len(command_runs), 4)
+            self.assertEqual(len(command_runs), 3)
             self.assertEqual(
                 [row["payload"]["cmd"] for row in command_runs].count(
                     f"git worktree add -b loom/MAT-REQ-001-S1 {worktree_root / 'MAT-REQ-001-S1'} main"
@@ -204,8 +204,8 @@ class P3ALangGraphTests(unittest.TestCase):
             started_rows = [row for row in rows if row["type"] == "command_started"]
             finished_rows = [row for row in rows if row["type"] == "command_run"]
 
-            self.assertEqual(len(started_rows), 4)
-            self.assertEqual(len(finished_rows), 4)
+            self.assertEqual(len(started_rows), 3)
+            self.assertEqual(len(finished_rows), 3)
             self.assertEqual(
                 [(row["payload"]["cmd"], row["payload"]["cwd"]) for row in started_rows],
                 [(row["payload"]["cmd"], row["payload"]["cwd"]) for row in finished_rows],
@@ -928,8 +928,152 @@ class P3ALangGraphTests(unittest.TestCase):
                         f"git worktree remove --force {worktree_root / 'MAT-REQ-001-S1'}",
                         0,
                     ),
-                    ("git branch -D loom/MAT-REQ-001-S1", 0),
                 ],
+            )
+
+    def test_passed_run_removes_worktree_but_retains_branch_commit_and_pointer_event(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            events_path = Path(tmpdir) / "events.jsonl"
+            execution_repo = Path(tmpdir) / "lingua-web"
+            execution_repo.mkdir()
+            _init_main_repo(execution_repo)
+            _seed_s1_scope_file(execution_repo)
+            worktree_root = Path(tmpdir) / "loom-worktrees"
+            contract_path = (
+                Path(__file__).resolve().parents[1]
+                / "specs"
+                / "MAT-REQ-001"
+                / "segments"
+                / "S1.yaml"
+            )
+
+            def work_runner(work_input) -> dict[str, object]:
+                target = Path(work_input.sandbox_path) / "app" / "routes" / "upload.py"
+                target.write_text("passed artifact\n", encoding="utf-8")
+                return {
+                    "step_id": work_input.step_id,
+                    "status": "succeeded",
+                    "summary": "wrote passing artifact",
+                    "sandbox_path": work_input.sandbox_path,
+                    "branch_name": work_input.branch_name,
+                    "observed_files_changed": [],
+                    "failure_reasons": [],
+                }
+
+            state = run_segment_graph(
+                contract_path=contract_path,
+                run_id="run-graph-retain-passed-001",
+                events_path=events_path,
+                execution_repo_path=execution_repo,
+                worktree_root=worktree_root,
+                work_runner=work_runner,
+                test_runner=_mock_test_session,
+            )
+
+            self.assertEqual(state["status"], "passed")
+            self.assertFalse((worktree_root / "MAT-REQ-001-S1").exists())
+            self.assertIn("loom/MAT-REQ-001-S1", _git(execution_repo, "branch", "--list"))
+            self.assertIn(
+                "MAT-REQ-001/S1 run_id=run-graph-retain-passed-001 status=passed",
+                _git(execution_repo, "log", "-1", "--format=%s", "loom/MAT-REQ-001-S1"),
+            )
+            self.assertEqual(
+                _git(execution_repo, "show", "loom/MAT-REQ-001-S1:app/routes/upload.py"),
+                "passed artifact\n",
+            )
+
+            rows, _ = load_event_rows(
+                events_path,
+                run_id="run-graph-retain-passed-001",
+                segment_id="MAT-REQ-001/S1",
+            )
+            pointer_rows = [
+                row
+                for row in rows
+                if row["actor"] == "harness" and row["type"] == "artifact_retained"
+            ]
+            self.assertEqual(
+                [row["payload"] for row in pointer_rows],
+                [{"branch_name": "loom/MAT-REQ-001-S1", "status": "passed"}],
+            )
+
+    def test_failed_run_retains_branch_and_marks_failed_in_commit_and_pointer_event(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            events_path = Path(tmpdir) / "events.jsonl"
+            execution_repo = Path(tmpdir) / "lingua-web"
+            execution_repo.mkdir()
+            _init_main_repo(execution_repo)
+            _seed_s1_scope_file(execution_repo)
+            worktree_root = Path(tmpdir) / "loom-worktrees"
+            contract_path = (
+                Path(__file__).resolve().parents[1]
+                / "specs"
+                / "MAT-REQ-001"
+                / "segments"
+                / "S1.yaml"
+            )
+            attempts = {"value": 0}
+
+            def work_runner(work_input) -> dict[str, object]:
+                attempts["value"] += 1
+                target = Path(work_input.sandbox_path) / "app" / "routes" / "upload.py"
+                target.write_text(f"failed artifact attempt {attempts['value']}\n", encoding="utf-8")
+                return {
+                    "step_id": work_input.step_id,
+                    "status": "succeeded",
+                    "summary": f"attempt {attempts['value']}",
+                    "sandbox_path": work_input.sandbox_path,
+                    "branch_name": work_input.branch_name,
+                    "observed_files_changed": [],
+                    "failure_reasons": [],
+                }
+
+            def failing_test_runner(test_input) -> dict[str, object]:
+                attempt = attempts["value"]
+                return _mock_test_attempt_result(
+                    base_dir=Path(tmpdir),
+                    attempt=attempt,
+                    passed=False,
+                    stdout=f"attempt {attempt} stdout\n",
+                    stderr=f"attempt {attempt} stderr\n",
+                )
+
+            state = run_segment_graph(
+                contract_path=contract_path,
+                run_id="run-graph-retain-failed-001",
+                events_path=events_path,
+                execution_repo_path=execution_repo,
+                worktree_root=worktree_root,
+                work_runner=work_runner,
+                test_runner=failing_test_runner,
+            )
+
+            self.assertEqual(state["status"], "failed")
+            self.assertEqual(state["attempts"], 4)
+            self.assertFalse((worktree_root / "MAT-REQ-001-S1").exists())
+            self.assertIn("loom/MAT-REQ-001-S1", _git(execution_repo, "branch", "--list"))
+            self.assertIn(
+                "MAT-REQ-001/S1 run_id=run-graph-retain-failed-001 status=failed",
+                _git(execution_repo, "log", "-1", "--format=%s", "loom/MAT-REQ-001-S1"),
+            )
+            self.assertEqual(
+                _git(execution_repo, "show", "loom/MAT-REQ-001-S1:app/routes/upload.py"),
+                "failed artifact attempt 4\n",
+            )
+
+            rows, _ = load_event_rows(
+                events_path,
+                run_id="run-graph-retain-failed-001",
+                segment_id="MAT-REQ-001/S1",
+            )
+            pointer_rows = [
+                row
+                for row in rows
+                if row["actor"] == "harness" and row["type"] == "artifact_retained"
+            ]
+            self.assertEqual(
+                [row["payload"] for row in pointer_rows],
+                [{"branch_name": "loom/MAT-REQ-001-S1", "status": "failed"}],
             )
 
     def test_empty_contract_test_selectors_skip_pytest_and_emit_harness_event(self) -> None:
@@ -997,7 +1141,6 @@ class P3ALangGraphTests(unittest.TestCase):
                     f"git worktree add -b loom/MAT-REQ-001-S9 {worktree_root / 'MAT-REQ-001-S9'} main",
                     "uv sync --extra dev",
                     f"git worktree remove --force {worktree_root / 'MAT-REQ-001-S9'}",
-                    "git branch -D loom/MAT-REQ-001-S9",
                 ],
             )
             skipped_rows = [
@@ -1239,6 +1382,14 @@ def _init_main_repo(git_dir: Path) -> None:
     _git(git_dir, "add", "README.md")
     _git(git_dir, "add", "pyproject.toml")
     _git(git_dir, "commit", "-m", "baseline")
+
+
+def _seed_s1_scope_file(git_dir: Path) -> None:
+    target = git_dir / "app" / "routes"
+    target.mkdir(parents=True, exist_ok=True)
+    (target / "upload.py").write_text("baseline upload route\n", encoding="utf-8")
+    _git(git_dir, "add", "app/routes/upload.py")
+    _git(git_dir, "commit", "-m", "seed s1 scope file")
 
 
 def _mock_work_session(work_input) -> dict[str, object]:

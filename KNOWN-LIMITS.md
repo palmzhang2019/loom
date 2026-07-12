@@ -40,3 +40,13 @@
 ## run_id 唯一性(P3d-3 收尾确立)
 - run_id 在同一 events log 中一次性使用;复用会使按 run_id 派生的视图混合多次执行(P3d-3 曾因此误判"双开 sandbox";实为一次失败run+一次成功run共用 run_id)。
 - 现由确定性闸强制:启动前检查 events log,重复 run_id 直接拒绝。
+
+## codex 失败可区分性(P3e 记,留待 P4)
+- 现状:codex 调用记录了 exit_code/duration,但无法区分"超时/命令错/模型没写对";fix 循环因此可能盲目重试非代码问题。
+- P3e 只保证原始事实(exit_code、duration)被观测全;超时机制与失败归类属 P4 review/audit 判断,不在 P3 做(避免过度设计)。
+
+## 验证方法本身要在对的执行平面(P3e 元教训)
+- P3e 排查"uv sync 0.22s 可疑"时,手动验证误在 loom repo(而非 lingua-web)开 worktree,
+  触发 "Extra dev not defined" 假象,一度误判为环境隔离/exit code 漏洞。
+- 实际:lingua-web main 上 uv sync --extra dev 真实成功(装 39 包,exit 0);0.22s 是 uv 缓存链接的正常速度。
+- 教训:验证 Loom 的执行环境时,须在真实执行平面(lingua-web)复现,否则验证脚本自身的 bug 会诬陷正确的系统。

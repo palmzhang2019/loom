@@ -48,12 +48,17 @@ class HarnessTests(unittest.TestCase):
 
         self.assertIsInstance(result, CommandResult)
         self.assertEqual(result.exit_code, 7)
-        self.assertEqual(mock_append_event.call_count, 1)
+        self.assertEqual(mock_append_event.call_count, 2)
 
-        event = mock_append_event.call_args.args[0]
-        self.assertEqual(event.actor, "harness")
-        self.assertEqual(event.type, "command_run")
-        self.assertEqual(event.payload["exit_code"], 7)
+        started_event = mock_append_event.call_args_list[0].args[0]
+        finished_event = mock_append_event.call_args_list[1].args[0]
+        self.assertEqual(started_event.actor, "harness")
+        self.assertEqual(started_event.type, "command_started")
+        self.assertEqual(started_event.payload["cmd"], cmd)
+        self.assertEqual(finished_event.actor, "harness")
+        self.assertEqual(finished_event.type, "command_run")
+        self.assertEqual(finished_event.payload["exit_code"], 7)
+        self.assertIn("duration_seconds", finished_event.payload)
 
     def test_run_observed_captures_real_stdout_nonce(self) -> None:
         nonce = "nonce-7fd52d54c7db4f10"
@@ -68,9 +73,9 @@ class HarnessTests(unittest.TestCase):
 
         self.assertEqual(result.exit_code, 0)
         self.assertIn(nonce, result.stdout)
-        self.assertEqual(mock_append_event.call_count, 1)
+        self.assertEqual(mock_append_event.call_count, 2)
 
-        event = mock_append_event.call_args.args[0]
+        event = mock_append_event.call_args_list[1].args[0]
         self.assertIn(nonce, event.payload["stdout"])
 
     def test_observe_files_changed_reports_actual_modified_file_and_hash(self) -> None:

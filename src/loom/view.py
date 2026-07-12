@@ -103,6 +103,7 @@ def render_html_document(
         "audit": "background:#f4cccc;color:#7a1f1f;border-color:#e6a8a8;",
     }
     type_styles = {
+        "command_started": "background:#e0f2fe;color:#075985;border-color:#7dd3fc;",
         "command_run": "background:#f4f4f5;color:#111827;border-color:#d4d4d8;",
         "files_changed": "background:#dcfce7;color:#166534;border-color:#86efac;",
         "step_started": "background:#dbeafe;color:#1d4ed8;border-color:#93c5fd;",

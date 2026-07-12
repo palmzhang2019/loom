@@ -38,6 +38,21 @@ def run_observed(
     path: Path | str = DEFAULT_EVENTS_PATH,
     payload: dict[str, object] | None = None,
 ) -> CommandResult:
+    append_event(
+        Event(
+            ts=_utc_now(),
+            segment_id=segment_id,
+            run_id=run_id,
+            actor="harness",
+            type="command_started",
+            payload={
+                "cmd": cmd,
+                "cwd": str(cwd) if cwd is not None else None,
+                **(payload or {}),
+            },
+        ),
+        path=path,
+    )
     started_at = time.monotonic()
     completed = subprocess.run(
         cmd,

@@ -166,6 +166,49 @@ class P3ALangGraphTests(unittest.TestCase):
                 work_finished["payload"]["result"]["work_result"]["sandbox_path"],
             )
 
+    def test_run_segment_graph_emits_started_and_completed_events_for_each_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            events_path = Path(tmpdir) / "events.jsonl"
+            execution_repo = Path(tmpdir) / "lingua-web"
+            execution_repo.mkdir()
+            _init_main_repo(execution_repo)
+            worktree_root = Path(tmpdir) / "loom-worktrees"
+            contract_path = (
+                Path(__file__).resolve().parents[1]
+                / "specs"
+                / "MAT-REQ-001"
+                / "segments"
+                / "S1.yaml"
+            )
+
+            run_segment_graph(
+                contract_path=contract_path,
+                run_id="run-graph-command-events-001",
+                events_path=events_path,
+                execution_repo_path=execution_repo,
+                worktree_root=worktree_root,
+                work_runner=_mock_work_session,
+                test_runner=_mock_test_session,
+            )
+
+            rows, _ = load_event_rows(
+                events_path,
+                run_id="run-graph-command-events-001",
+                segment_id="MAT-REQ-001/S1",
+            )
+            started_rows = [row for row in rows if row["type"] == "command_started"]
+            finished_rows = [row for row in rows if row["type"] == "command_run"]
+
+            self.assertEqual(len(started_rows), 4)
+            self.assertEqual(len(finished_rows), 4)
+            self.assertEqual(
+                [(row["payload"]["cmd"], row["payload"]["cwd"]) for row in started_rows],
+                [(row["payload"]["cmd"], row["payload"]["cwd"]) for row in finished_rows],
+            )
+            for row in finished_rows:
+                self.assertIn("exit_code", row["payload"])
+                self.assertIn("duration_seconds", row["payload"])
+
     def test_existing_view_renders_the_three_node_run(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             events_path = Path(tmpdir) / "events.jsonl"

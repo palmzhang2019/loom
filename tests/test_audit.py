@@ -85,9 +85,14 @@ def _append_files_changed(events_path: Path, paths: list[str]) -> None:
     )
 
 
-def _run_audit(root: Path, repo_path: Path, changed_paths: list[str]) -> Path:
+def _run_audit(
+    root: Path,
+    repo_path: Path,
+    changed_paths: list[str] | None,
+) -> Path:
     events_path = root / "events.jsonl"
-    _append_files_changed(events_path, changed_paths)
+    if changed_paths is not None:
+        _append_files_changed(events_path, changed_paths)
     return run_segment_audit(
         contract_path=CONTRACT_PATH,
         run_id=RUN_ID,
@@ -215,6 +220,77 @@ class SegmentAuditTests(unittest.TestCase):
             secret_values = [openai_key, aws_key, api_key, password, token]
             self.assertFalse(any(value in report for value in secret_values))
             self.assertFalse(any(value in event_log for value in secret_values))
+
+    def test_openai_key_followed_by_non_ascii_character_is_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo_path = root / "lingua-web"
+            repo_path.mkdir()
+            secret = "sk-" + "D" * 20 + "Ａ"
+            _init_audit_repo(
+                repo_path,
+                branch_files={
+                    "app/routes/upload.py": f'baseline\nclient_secret = "{secret}"\n'
+                },
+            )
+
+            report_path = _run_audit(root, repo_path, ["app/routes/upload.py"])
+
+            report = report_path.read_text(encoding="utf-8")
+            event_log = (root / "events.jsonl").read_text(encoding="utf-8")
+            self.assertIn("secret scan gate: `blocked`", report)
+            self.assertIn("reason: `secret_detected`", report)
+            self.assertIn("`app/routes/upload.py:2` — `openai_api_key`", report)
+            self.assertIn("overall verdict: `blocked`", report)
+            self.assertNotIn(secret, report)
+            self.assertNotIn(secret, event_log)
+
+    def test_fake_marker_does_not_exempt_explicit_credential_assignment(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo_path = root / "lingua-web"
+            repo_path.mkdir()
+            secret = "FAKE-" + "8" * 24
+            _init_audit_repo(
+                repo_path,
+                branch_files={
+                    "app/routes/upload.py": f'baseline\napi_key = "{secret}"\n'
+                },
+            )
+
+            report_path = _run_audit(root, repo_path, ["app/routes/upload.py"])
+
+            report = report_path.read_text(encoding="utf-8")
+            event_log = (root / "events.jsonl").read_text(encoding="utf-8")
+            self.assertIn("secret scan gate: `blocked`", report)
+            self.assertIn("reason: `secret_detected`", report)
+            self.assertIn("`app/routes/upload.py:2` — `api_key_assignment`", report)
+            self.assertIn("overall verdict: `blocked`", report)
+            self.assertNotIn(secret, report)
+            self.assertNotIn(secret, event_log)
+
+    def test_missing_files_changed_observation_blocks_scope_as_unauditable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo_path = root / "lingua-web"
+            repo_path.mkdir()
+            _init_audit_repo(
+                repo_path,
+                branch_files={"app/routes/upload.py": "baseline\nremove route\n"},
+            )
+
+            report_path = _run_audit(root, repo_path, None)
+
+            report = report_path.read_text(encoding="utf-8")
+            self.assertIn("scope gate: `blocked`", report)
+            self.assertIn("reason: `no_observed_changes`", report)
+            self.assertIn("harness-observed changed files:\n  - (none)", report)
+            self.assertIn("secret scan gate: `passed`", report)
+            self.assertIn("overall verdict: `blocked`", report)
+
+            rows, _ = load_event_rows(root / "events.jsonl", run_id=RUN_ID)
+            completed = [row for row in rows if row["type"] == "audit_completed"]
+            self.assertEqual(completed[0]["payload"]["verdict"], "blocked")
 
     def test_secret_present_only_on_deleted_line_does_not_block(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

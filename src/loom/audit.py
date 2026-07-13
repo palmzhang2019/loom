@@ -9,15 +9,19 @@ from shlex import quote
 
 from .events import DEFAULT_EVENTS_PATH, Event, append_event
 from .graph import _is_in_scope, _load_segment_contract
-from .harness import load_observed_changed_paths, run_observed
+from .harness import load_observed_file_changes, run_observed
 from .sandbox import DEFAULT_EXECUTION_REPO_PATH
 
 
-_OPENAI_KEY_PATTERN = re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b")
-_AWS_ACCESS_KEY_PATTERN = re.compile(r"\bAKIA[0-9A-Z]{16}\b")
+_OPENAI_KEY_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9_])sk-[A-Za-z0-9_-]{20,}(?![A-Za-z0-9_-])"
+)
+_AWS_ACCESS_KEY_PATTERN = re.compile(
+    r"(?<![0-9A-Z])AKIA[0-9A-Z]{16}(?![0-9A-Z])"
+)
 _CREDENTIAL_ASSIGNMENT_PATTERN = re.compile(
     r"""
-    \b(?P<name>api[_-]?key|password|token)\b
+    (?<![A-Za-z0-9_])(?P<name>api[_-]?key|password|token)(?![A-Za-z0-9_])
     \s*=\s*
     (?:
         (?P<quote>["'])(?P<quoted_value>[^"'\r\n]{8,})(?P=quote)
@@ -36,8 +40,6 @@ _PLACEHOLDER_MARKERS = (
     "change_me",
     "dummy",
     "example",
-    "fake",
-    "placeholder",
     "redacted",
     "replace-me",
     "replace_me",
@@ -72,11 +74,12 @@ def run_segment_audit(
     events_file = Path(events_path)
     repo_path = Path(execution_repo_path)
 
-    changed_paths = load_observed_changed_paths(
+    observed_changes = load_observed_file_changes(
         events_path=events_file,
         segment_id=segment_id,
         run_id=run_id,
     )
+    changed_paths = observed_changes.paths
     out_of_scope_paths = [
         path for path in changed_paths if not _is_in_scope(path, scope_paths)
     ]
@@ -101,7 +104,11 @@ def run_segment_audit(
         raise RuntimeError(diff_result.stderr.strip() or "git diff failed")
 
     secret_findings = _scan_added_diff_lines(diff_result.stdout)
-    scope_verdict = "blocked" if out_of_scope_paths else "passed"
+    scope_verdict = (
+        "blocked"
+        if not observed_changes.has_observation or out_of_scope_paths
+        else "passed"
+    )
     secret_verdict = "blocked" if secret_findings else "passed"
     overall_verdict = (
         "blocked"
@@ -117,6 +124,7 @@ def run_segment_audit(
             audited_branch=audited_branch,
             scope_paths=scope_paths,
             changed_paths=changed_paths,
+            has_scope_observation=observed_changes.has_observation,
             out_of_scope_paths=out_of_scope_paths,
             secret_findings=secret_findings,
             overall_verdict=overall_verdict,
@@ -228,14 +236,19 @@ def _render_audit_report(
     audited_branch: str,
     scope_paths: list[str],
     changed_paths: list[str],
+    has_scope_observation: bool,
     out_of_scope_paths: list[str],
     secret_findings: list[SecretFinding],
     overall_verdict: str,
 ) -> str:
-    scope_verdict = "blocked" if out_of_scope_paths else "passed"
+    scope_verdict = (
+        "blocked" if not has_scope_observation or out_of_scope_paths else "passed"
+    )
     secret_verdict = "blocked" if secret_findings else "passed"
     scope_reason = (
-        "out_of_scope"
+        "no_observed_changes"
+        if not has_scope_observation
+        else "out_of_scope"
         if out_of_scope_paths
         else "all_observed_changes_within_scope"
     )

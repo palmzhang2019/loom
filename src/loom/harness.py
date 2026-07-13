@@ -27,20 +27,27 @@ class FileChange:
     after_hash: str | None
 
 
+@dataclass(frozen=True)
+class ObservedFileChanges:
+    paths: list[str]
+    has_observation: bool
+
+
 T = TypeVar("T")
 
 
-def load_observed_changed_paths(
+def load_observed_file_changes(
     *,
     events_path: Path | str,
     segment_id: str,
     run_id: str,
-) -> list[str]:
+) -> ObservedFileChanges:
     path = Path(events_path)
     if not path.exists():
-        return []
+        return ObservedFileChanges(paths=[], has_observation=False)
 
     changed_paths: set[str] = set()
+    has_observation = False
     with path.open("r", encoding="utf-8") as handle:
         for raw_line in handle:
             if not raw_line.strip():
@@ -64,13 +71,30 @@ def load_observed_changed_paths(
             files = payload.get("files")
             if not isinstance(files, list):
                 continue
+            has_observation = True
             for file_change in files:
                 if not isinstance(file_change, dict):
                     continue
                 changed_path = file_change.get("path")
                 if isinstance(changed_path, str) and changed_path:
                     changed_paths.add(changed_path)
-    return sorted(changed_paths)
+    return ObservedFileChanges(
+        paths=sorted(changed_paths),
+        has_observation=has_observation,
+    )
+
+
+def load_observed_changed_paths(
+    *,
+    events_path: Path | str,
+    segment_id: str,
+    run_id: str,
+) -> list[str]:
+    return load_observed_file_changes(
+        events_path=events_path,
+        segment_id=segment_id,
+        run_id=run_id,
+    ).paths
 
 
 def run_observed(

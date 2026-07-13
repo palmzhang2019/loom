@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 import time
 from dataclasses import dataclass
@@ -27,6 +28,49 @@ class FileChange:
 
 
 T = TypeVar("T")
+
+
+def load_observed_changed_paths(
+    *,
+    events_path: Path | str,
+    segment_id: str,
+    run_id: str,
+) -> list[str]:
+    path = Path(events_path)
+    if not path.exists():
+        return []
+
+    changed_paths: set[str] = set()
+    with path.open("r", encoding="utf-8") as handle:
+        for raw_line in handle:
+            if not raw_line.strip():
+                continue
+            try:
+                event = json.loads(raw_line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(event, dict):
+                continue
+            if (
+                event.get("segment_id") != segment_id
+                or event.get("run_id") != run_id
+                or event.get("actor") != "harness"
+                or event.get("type") != "files_changed"
+            ):
+                continue
+            payload = event.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            files = payload.get("files")
+            if not isinstance(files, list):
+                continue
+            for file_change in files:
+                if not isinstance(file_change, dict):
+                    continue
+                changed_path = file_change.get("path")
+                if isinstance(changed_path, str) and changed_path:
+                    changed_paths.add(changed_path)
+    return sorted(changed_paths)
 
 
 def run_observed(

@@ -10,7 +10,7 @@ from typing import Any, Callable
 
 from .events import DEFAULT_EVENTS_PATH, Event, append_event
 from .graph import AcceptanceCriterion, _is_in_scope, _load_segment_contract
-from .harness import run_observed
+from .harness import load_observed_changed_paths, run_observed
 from .sandbox import DEFAULT_EXECUTION_REPO_PATH
 
 
@@ -44,7 +44,7 @@ def run_segment_review(
     segment_id = str(contract["segment_id"])
     events_file = Path(events_path)
     repo_path = Path(execution_repo_path)
-    changed_paths = _load_observed_changed_paths(
+    changed_paths = load_observed_changed_paths(
         events_path=events_file,
         segment_id=segment_id,
         run_id=run_id,
@@ -149,48 +149,6 @@ def _run_codex_review_session(input_data: ReviewSessionInput) -> dict[str, objec
     if not isinstance(output, dict):
         raise RuntimeError("codex review output must be a JSON object")
     return output
-
-
-def _load_observed_changed_paths(
-    *,
-    events_path: Path,
-    segment_id: str,
-    run_id: str,
-) -> list[str]:
-    if not events_path.exists():
-        return []
-
-    changed_paths: set[str] = set()
-    with events_path.open("r", encoding="utf-8") as handle:
-        for raw_line in handle:
-            if not raw_line.strip():
-                continue
-            try:
-                event = json.loads(raw_line)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(event, dict):
-                continue
-            if (
-                event.get("segment_id") != segment_id
-                or event.get("run_id") != run_id
-                or event.get("actor") != "harness"
-                or event.get("type") != "files_changed"
-            ):
-                continue
-            payload = event.get("payload")
-            if not isinstance(payload, dict):
-                continue
-            files = payload.get("files")
-            if not isinstance(files, list):
-                continue
-            for file_change in files:
-                if not isinstance(file_change, dict):
-                    continue
-                path = file_change.get("path")
-                if isinstance(path, str) and path:
-                    changed_paths.add(path)
-    return sorted(changed_paths)
 
 
 def _validate_review_advice(

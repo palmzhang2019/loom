@@ -281,15 +281,18 @@ def _load_retained_branch_statuses(events_path: Path) -> dict[str, str]:
                 continue
             if not isinstance(payload, dict):
                 continue
-            if payload.get("type") != _RETAINED_EVENT_TYPE:
-                continue
             event_payload = payload.get("payload")
             if not isinstance(event_payload, dict):
                 continue
-            branch_name = event_payload.get("branch_name")
-            status = event_payload.get("status")
-            if isinstance(branch_name, str) and isinstance(status, str):
-                statuses[branch_name] = status
+            if payload.get("type") == _RETAINED_EVENT_TYPE:
+                branch_name = event_payload.get("branch_name")
+                status = event_payload.get("status")
+                if isinstance(branch_name, str) and isinstance(status, str):
+                    statuses[branch_name] = status
+            elif payload.get("type") == "merge_rejected":
+                branch_name = event_payload.get("source_branch")
+                if isinstance(branch_name, str):
+                    statuses[branch_name] = "rejected"
     return statuses
 
 

@@ -126,7 +126,6 @@ def _run_codex_review_session(input_data: ReviewSessionInput) -> dict[str, objec
             [
                 "codex exec",
                 "--sandbox read-only",
-                "--ephemeral",
                 "--color never",
                 f"--output-schema {quote(str(schema_path))}",
                 f"--output-last-message {quote(str(output_path))}",

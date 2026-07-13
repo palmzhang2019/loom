@@ -199,7 +199,7 @@ class SegmentReviewTests(unittest.TestCase):
                 )
                 self.assertIn("codex exec", cmd)
                 self.assertIn("--sandbox read-only", cmd)
-                self.assertIn("--ephemeral", cmd)
+                self.assertNotIn("--ephemeral", cmd)
                 self.assertEqual(Path(cwd), repo_path)
                 return CommandResult(0, "", "", 0.1)
 

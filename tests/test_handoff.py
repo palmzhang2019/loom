@@ -93,7 +93,7 @@ def _git(repo_path: Path, *args: str) -> str:
     return completed.stdout
 
 
-def _init_seam_repo(repo_path: Path) -> None:
+def _init_seam_repo(repo_path: Path, *, add_test_file: bool = True) -> None:
     _git(repo_path, "init", "-b", "main")
     _git(repo_path, "config", "user.name", "Loom Tests")
     _git(repo_path, "config", "user.email", "loom-tests@example.com")
@@ -105,7 +105,14 @@ def _init_seam_repo(repo_path: Path) -> None:
 
     _git(repo_path, "switch", "-c", SOURCE_BRANCH)
     source_path.write_text(HEAD_SOURCE, encoding="utf-8")
-    _git(repo_path, "add", "app/models_and_routes.py")
+    if add_test_file:
+        test_path = repo_path / "tests" / "test_remove_material_tag.py"
+        test_path.parent.mkdir(parents=True)
+        test_path.write_text(
+            "def test_remove_material_tag() -> None:\n    pass\n",
+            encoding="utf-8",
+        )
+    _git(repo_path, "add", "-A")
     _git(repo_path, "commit", "-m", "segment artifact")
     _git(repo_path, "switch", "main")
 
@@ -122,31 +129,6 @@ def _handoff_path(root: Path, run_id: str = RUN_ID) -> Path:
     return root / "runs" / run_id / "handoff" / "handoff.yaml"
 
 
-def _append_observed_test_files(events_path: Path) -> None:
-    append_event(
-        Event(
-            ts="2026-07-14T00:00:00Z",
-            segment_id=SEGMENT_ID,
-            run_id=RUN_ID,
-            actor="test",
-            type="step_finished",
-            payload={
-                "step": "test",
-                "result": {
-                    "test_result": {
-                        "status": "passed",
-                        "test_selectors": [
-                            "tests/test_s3t_tagging.py",
-                            "tests/test_s4bb_material_tag_wiring.py",
-                        ],
-                    }
-                },
-            },
-        ),
-        path=events_path,
-    )
-
-
 class HandoffRecordTests(unittest.TestCase):
     def test_pending_handoff_extracts_only_structural_seams_and_contract_fields(self) -> None:
         handoff = importlib.import_module("loom.handoff")
@@ -156,7 +138,6 @@ class HandoffRecordTests(unittest.TestCase):
             repo_path.mkdir()
             _init_seam_repo(repo_path)
             events_path = root / "events.jsonl"
-            _append_observed_test_files(events_path)
 
             record_path = handoff.generate_pending_handoff(
                 contract_path=CONTRACT_PATH,
@@ -211,8 +192,8 @@ class HandoffRecordTests(unittest.TestCase):
             self.assertIn("key_decisions: []", text)
             self.assertIn("merge_commit: null", text)
             self.assertIn("test_files:", text)
-            self.assertIn("- tests/test_s3t_tagging.py", text)
-            self.assertIn("- tests/test_s4bb_material_tag_wiring.py", text)
+            self.assertIn("- tests/test_remove_material_tag.py", text)
+            self.assertNotIn('signature: "test_remove_material_tag() -> None"', text)
             self.assertIn("as_built_diagram: null", text)
 
             rows, invalid_lines = load_event_rows(events_path, run_id=RUN_ID)
@@ -225,13 +206,13 @@ class HandoffRecordTests(unittest.TestCase):
                 {"path": str(record_path), "merge_status": "pending"},
             )
 
-    def test_pending_handoff_does_not_claim_unobserved_contract_tests(self) -> None:
+    def test_pending_handoff_does_not_claim_contract_tests_absent_from_diff(self) -> None:
         handoff = importlib.import_module("loom.handoff")
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             repo_path = root / "lingua-web"
             repo_path.mkdir()
-            _init_seam_repo(repo_path)
+            _init_seam_repo(repo_path, add_test_file=False)
             events_path = root / "events.jsonl"
 
             record_path = handoff.generate_pending_handoff(

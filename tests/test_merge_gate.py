@@ -83,7 +83,12 @@ def _init_merge_repo(repo_path: Path) -> tuple[str, str]:
     return main_commit, source_commit
 
 
-def _append_gate_inputs(root: Path, *, audit_verdict: str) -> Path:
+def _append_gate_inputs(
+    root: Path,
+    *,
+    audit_verdict: str,
+    include_review: bool = True,
+) -> Path:
     events_path = root / "events.jsonl"
     review_path = root / "runs" / RUN_ID / "review" / "review.md"
     audit_path = root / "runs" / RUN_ID / "audit" / "audit.md"
@@ -105,20 +110,21 @@ def _append_gate_inputs(root: Path, *, audit_verdict: str) -> Path:
         ),
         path=events_path,
     )
-    append_event(
-        Event(
-            ts="2026-07-14T00:01:00Z",
-            segment_id=SEGMENT_ID,
-            run_id=RUN_ID,
-            actor="harness",
-            type="review_completed",
-            payload={
-                "report_path": str(review_path),
-                "reviewed_branch": SOURCE_BRANCH,
-            },
-        ),
-        path=events_path,
-    )
+    if include_review:
+        append_event(
+            Event(
+                ts="2026-07-14T00:01:00Z",
+                segment_id=SEGMENT_ID,
+                run_id=RUN_ID,
+                actor="harness",
+                type="review_completed",
+                payload={
+                    "report_path": str(review_path),
+                    "reviewed_branch": SOURCE_BRANCH,
+                },
+            ),
+            path=events_path,
+        )
     append_event(
         Event(
             ts="2026-07-14T00:02:00Z",
@@ -167,6 +173,35 @@ def _top_level_keys(text: str) -> list[str]:
 
 
 class HumanMergeGateTests(unittest.TestCase):
+    def test_missing_review_refuses_before_handoff_or_interrupt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo_path = root / "lingua-web"
+            repo_path.mkdir()
+            _init_merge_repo(repo_path)
+            events_path = _append_gate_inputs(
+                root,
+                audit_verdict="passed",
+                include_review=False,
+            )
+            presentations: list[dict[str, object]] = []
+
+            result = _run_merge_gate(
+                repo_path=repo_path,
+                events_path=events_path,
+                decision_provider=lambda value: presentations.append(value)
+                or {"decision": "approve"},
+            )
+
+            self.assertEqual(result["status"], "refused")
+            self.assertEqual(result["refusal_reason"], "review_missing")
+            self.assertEqual(presentations, [])
+            self.assertFalse(_handoff_path(root).exists())
+            rows, _ = load_event_rows(events_path, run_id=RUN_ID)
+            self.assertFalse(
+                any(row["type"] in {"handoff_generated", "handoff_updated"} for row in rows)
+            )
+
     def test_blocked_audit_refuses_before_interrupt_without_override(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -374,6 +409,28 @@ class HumanMergeGateTests(unittest.TestCase):
             self.assertEqual(
                 lifecycle,
                 ["handoff_generated", "merge_rejected", "handoff_updated"],
+            )
+
+    def test_human_reject_requires_a_reason_before_reject_event(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo_path = root / "lingua-web"
+            repo_path.mkdir()
+            _init_merge_repo(repo_path)
+            events_path = _append_gate_inputs(root, audit_verdict="passed")
+
+            with self.assertRaisesRegex(ValueError, "rejection reason"):
+                _run_merge_gate(
+                    repo_path=repo_path,
+                    events_path=events_path,
+                    decision_provider=lambda _: {"decision": "reject", "reason": "  "},
+                )
+
+            rows, _ = load_event_rows(events_path, run_id=RUN_ID)
+            self.assertFalse(any(row["type"] == "merge_rejected" for row in rows))
+            self.assertIn(
+                "merge_status: pending",
+                _handoff_path(root).read_text(encoding="utf-8"),
             )
 
 

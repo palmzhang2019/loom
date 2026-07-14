@@ -122,6 +122,31 @@ def _handoff_path(root: Path, run_id: str = RUN_ID) -> Path:
     return root / "runs" / run_id / "handoff" / "handoff.yaml"
 
 
+def _append_observed_test_files(events_path: Path) -> None:
+    append_event(
+        Event(
+            ts="2026-07-14T00:00:00Z",
+            segment_id=SEGMENT_ID,
+            run_id=RUN_ID,
+            actor="test",
+            type="step_finished",
+            payload={
+                "step": "test",
+                "result": {
+                    "test_result": {
+                        "status": "passed",
+                        "test_selectors": [
+                            "tests/test_s3t_tagging.py",
+                            "tests/test_s4bb_material_tag_wiring.py",
+                        ],
+                    }
+                },
+            },
+        ),
+        path=events_path,
+    )
+
+
 class HandoffRecordTests(unittest.TestCase):
     def test_pending_handoff_extracts_only_structural_seams_and_contract_fields(self) -> None:
         handoff = importlib.import_module("loom.handoff")
@@ -131,6 +156,7 @@ class HandoffRecordTests(unittest.TestCase):
             repo_path.mkdir()
             _init_seam_repo(repo_path)
             events_path = root / "events.jsonl"
+            _append_observed_test_files(events_path)
 
             record_path = handoff.generate_pending_handoff(
                 contract_path=CONTRACT_PATH,
@@ -198,6 +224,100 @@ class HandoffRecordTests(unittest.TestCase):
                 generated[0]["payload"],
                 {"path": str(record_path), "merge_status": "pending"},
             )
+
+    def test_pending_handoff_does_not_claim_unobserved_contract_tests(self) -> None:
+        handoff = importlib.import_module("loom.handoff")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo_path = root / "lingua-web"
+            repo_path.mkdir()
+            _init_seam_repo(repo_path)
+            events_path = root / "events.jsonl"
+
+            record_path = handoff.generate_pending_handoff(
+                contract_path=CONTRACT_PATH,
+                run_id=RUN_ID,
+                source_branch=SOURCE_BRANCH,
+                events_path=events_path,
+                execution_repo_path=repo_path,
+            )
+
+            text = record_path.read_text(encoding="utf-8")
+            self.assertIn("  test_files: []", text)
+            self.assertNotIn("tests/test_s3t_tagging.py", text)
+            self.assertNotIn("tests/test_s4bb_material_tag_wiring.py", text)
+
+    def test_extractor_avoids_route_and_db_false_positives(self) -> None:
+        handoff = importlib.import_module("loom.handoff")
+        before = """\
+from fastapi import APIRouter
+from sqlalchemy import Column, String
+
+router = APIRouter(prefix="/items")
+
+@router.get("/")
+def list_items(limit: int = 10) -> list[str]:
+    return []
+
+def maintenance() -> None:
+    pass
+
+class Item:
+    __tablename__ = "items"
+    name = Column(String, index=True, nullable=True)
+"""
+        after = """\
+from fastapi import APIRouter
+from sqlalchemy import Column, String
+
+router = APIRouter(prefix="/items")
+
+@router.get("/")
+def list_items(limit: str = "10") -> list[str]:
+    return []
+
+def maintenance() -> None:
+    _add_column_if_missing("items", "shadow", "TEXT")
+
+class Item:
+    __tablename__ = "items"
+    name = Column(String, nullable=True, index=True)
+"""
+
+        seams = handoff.extract_python_seams(
+            [handoff.SourcePair(path="app/items.py", before=before, after=after)]
+        )
+
+        self.assertEqual(
+            [(seam.kind, seam.signature) for seam in seams],
+            [("function", "list_items(limit: str='10') -> list[str]")],
+        )
+
+    def test_adding_one_route_decorator_does_not_redeclare_existing_routes(self) -> None:
+        handoff = importlib.import_module("loom.handoff")
+        before = """\
+from fastapi import APIRouter
+
+router = APIRouter(prefix="/items")
+
+@router.get("/a")
+@router.get("/b")
+def list_items() -> list[str]:
+    return []
+"""
+        after = before.replace(
+            '@router.get("/a")',
+            '@router.get("/new")\n@router.get("/a")',
+        )
+
+        seams = handoff.extract_python_seams(
+            [handoff.SourcePair(path="app/items.py", before=before, after=after)]
+        )
+
+        self.assertEqual(
+            [(seam.kind, seam.signature) for seam in seams],
+            [("route", "GET /items/new")],
+        )
 
     def test_approve_updates_pending_record_to_merged_with_actual_commit(self) -> None:
         handoff = importlib.import_module("loom.handoff")
@@ -281,6 +401,44 @@ class HandoffRecordTests(unittest.TestCase):
                 updated[0]["payload"],
                 {"path": str(record_path), "merge_status": "rejected"},
             )
+
+    def test_rejected_update_requires_pending_state_and_human_reason(self) -> None:
+        handoff = importlib.import_module("loom.handoff")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo_path = root / "lingua-web"
+            repo_path.mkdir()
+            _init_seam_repo(repo_path)
+            events_path = root / "events.jsonl"
+            handoff.generate_pending_handoff(
+                contract_path=CONTRACT_PATH,
+                run_id=RUN_ID,
+                source_branch=SOURCE_BRANCH,
+                events_path=events_path,
+                execution_repo_path=repo_path,
+            )
+
+            with self.assertRaisesRegex(ValueError, "reject_reason"):
+                handoff.mark_handoff_rejected(
+                    contract_path=CONTRACT_PATH,
+                    run_id=RUN_ID,
+                    reject_reason="   ",
+                    events_path=events_path,
+                )
+
+            handoff.mark_handoff_merged(
+                contract_path=CONTRACT_PATH,
+                run_id=RUN_ID,
+                merge_commit="abc123merge",
+                events_path=events_path,
+            )
+            with self.assertRaisesRegex(ValueError, "pending"):
+                handoff.mark_handoff_rejected(
+                    contract_path=CONTRACT_PATH,
+                    run_id=RUN_ID,
+                    reject_reason="late rejection",
+                    events_path=events_path,
+                )
 
     def test_cli_materializes_existing_rejection_without_diff_or_seams(self) -> None:
         handoff = importlib.import_module("loom.handoff")

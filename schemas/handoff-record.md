@@ -34,6 +34,8 @@
 | `deferred` | 契约带入 + LLM 蒸馏 | 延期项 / 已知限制 |
 | `key_decisions` | LLM 蒸馏(软) | 约束未来的决策 + 理由 |
 | `pointers` | harness 抽(硬) | 合入 commit / 测试文件 / as-built 图 |
+| `merge_status` | harness 搬运合入闸结果 | pending / merged / rejected 生命周期 |
+| `reject_reason` | 人类合入闸输入(仅 rejected) | 保留人类给出的拒绝理由 |
 
 ---
 
@@ -47,6 +49,7 @@
 - 只记**跨 segment 边界被调用/依赖**的东西;内部实现(私有函数、局部变量)不是 seam。
 - **必须由 harness 从真实 diff 抽取**——它是下游 `depends_on` 之后要机械对接的"对接说明书",写错则下游崩。因此不容许 LLM 凭记忆写。
 - 埋给 P4/P5 的实现任务:harness 需能从 diff 解析新增/改动的函数签名、路由、DB 变更。
+- 抽取采用保守口径:只记录 diff 中结构可见的新增/改动接口(路由、模块顶层函数签名、表结构变更);函数体内未形成顶层接口的逻辑不计 seam,也不从 DML 推断 DB seam。硬事实宁漏勿误报,不作模糊推断。
 
 ```yaml
 seams:
@@ -54,8 +57,6 @@ seams:
     signature: "DELETE /material/{mid}/source-tag/{tid}"
   - kind: function
     signature: "remove_material_tag(material_id, tag_id) -> bool"
-  - kind: db
-    signature: "material_tag 表: 删除 (material_id, tag_id) 行"
 # kind ∈ route | function | db | class
 ```
 
@@ -99,13 +100,12 @@ pointers:
 
 ```yaml
 covers_req: MAT-REQ-001
+merge_status: merged
 seams:
   - kind: route
     signature: "DELETE /material/{mid}/source-tag/{tid}"
   - kind: function
     signature: "remove_material_tag(material_id, tag_id) -> bool"
-  - kind: db
-    signature: "material_tag 表: 删除 (material_id, tag_id) 行"
 deferred:
   - text: 前端移除入口与确认弹窗
     origin: contract
@@ -139,3 +139,34 @@ pointers:
 - 本 schema 于 P2 定稿,与 `segment-contract.schema.md` 配套闭合。
 - seams / pointers 的确定性抽取能力属 P4/P5 实现任务;此处只定字段与来源原则。
 - deferred.discovered / key_decisions 的 LLM 蒸馏属 Stage 4 实现;此处只定字段与"软信息"定位。
+
+### merge_status `(必填)`
+交接记录在产物就绪时即生成(seams/decisions 可在合入前从 branch 抽取),合入结果通过本字段与
+`pointers.merge_commit` 反映。取值:
+
+- `pending` —— 交接记录主体已生成(seams、decisions 等),尚未经过人类合入闸。
+- `merged` —— 人类合入闸 approve,已 merge 进目标分支;此时 `pointers.merge_commit` 必填。
+- `rejected` —— 人类合入闸 reject;附 `reject_reason`(人类给出的拒绝理由)。
+  **rejected 状态下不抽取 seams**(被拒产物代码未入库,其接口下游不可依赖);
+  交接记录只保留:covers_req、merge_status=rejected、reject_reason、以及已知的 deferred(遗留)。
+
+设计依据:seams 是 harness 从 diff 抽取的事实,合入前就已存在,不必等合入才生成;真正只有合入后才能填的是
+`pointers.merge_commit`。故交接记录主体在产物就绪时生成,合入闸的结果只更新 merge_status 与 merge_commit。
+这也让被拒的 segment 有一份"为何被拒、留下什么坑"的诊断记录(供复盘、改契约、重跑)。
+
+```yaml
+# 合入成功:
+merge_status: merged
+pointers:
+  merge_commit: <hash>
+  ...
+
+# 被拒:
+merge_status: rejected
+reject_reason: "移除功能没有测试覆盖;工作自我报告不可靠"
+# 不含 seams;保留 covers_req、deferred
+```
+
+### seams 抽取时机(修订)
+seams 在【产物就绪、merge_status ∈ {pending, merged}】时由 harness 从 branch 相对 main 的 diff 抽取。
+merge_status == rejected 时不抽 seams(见上)。

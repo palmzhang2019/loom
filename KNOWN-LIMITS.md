@@ -78,3 +78,6 @@
 - 若当时信报告 approve,未验证功能即合入。故 reject。
 - 待办:review 需补"测试充分性"项(每条 AC 是否有对应测试覆盖);这是 review 可信度的关键,非可选。
 - 更上游:test_selectors 只选了现有测试,没有"为本 segment 新功能生成测试"的环节(BRIEF 里的 test 按 spec 派生,尚未做)。
+
+## seams 抽取器技术栈边界(P4-4)
+- 当前 seams 确定性抽取绑定 Python/FastAPI/SQLAlchemy;更换技术栈时需重写相应抽取规则。

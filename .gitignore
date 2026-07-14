@@ -4,7 +4,12 @@ events.jsonl
 events.*.jsonl
 *.events.jsonl
 .loom-runtime/
-runs/
+runs/*
+!runs/*/
+runs/*/*
+!runs/*/handoff/
+runs/*/handoff/*
+!runs/*/handoff/handoff.yaml
 
 # === 通用 ===
 __pycache__/

@@ -13,6 +13,11 @@ from langgraph.types import Command, interrupt
 
 from .events import DEFAULT_EVENTS_PATH, Event, append_event
 from .graph import _load_segment_contract
+from .handoff import (
+    generate_pending_handoff,
+    mark_handoff_merged,
+    mark_handoff_rejected,
+)
 from .harness import run_observed
 from .sandbox import DEFAULT_EXECUTION_REPO_PATH, _branch_exists
 
@@ -36,6 +41,7 @@ class MergeGateState(TypedDict, total=False):
     human_decision: str
     rejection_reason: str
     merge_commit: str
+    handoff_path: str
 
 
 DecisionProvider = Callable[[dict[str, object]], dict[str, str]]
@@ -90,6 +96,7 @@ def run_merge_gate(
 def _build_merge_gate_graph(*, checkpointer: InMemorySaver):
     workflow = StateGraph(MergeGateState)
     workflow.add_node("audit_precheck", _audit_precheck_node)
+    workflow.add_node("handoff_generate", _handoff_generate_node)
     workflow.add_node("human_decision", _human_decision_node)
     workflow.add_node("approve", _approve_node)
     workflow.add_node("reject", _reject_node)
@@ -97,8 +104,9 @@ def _build_merge_gate_graph(*, checkpointer: InMemorySaver):
     workflow.add_conditional_edges(
         "audit_precheck",
         _route_after_audit,
-        {"refused": END, "human": "human_decision"},
+        {"refused": END, "human": "handoff_generate"},
     )
+    workflow.add_edge("handoff_generate", "human_decision")
     workflow.add_conditional_edges(
         "human_decision",
         _route_after_human,
@@ -136,9 +144,11 @@ def _audit_precheck_node(state: MergeGateState) -> MergeGateState:
         branch_field="reviewed_branch",
         source_branch=state["source_branch"],
     )
-    review_report_path = "(missing)"
-    if review_payload is not None and isinstance(review_payload.get("report_path"), str):
-        review_report_path = str(review_payload["report_path"])
+    if review_payload is None:
+        return _refuse_merge(state, reason="review_missing")
+    review_report_path = review_payload.get("report_path")
+    if not isinstance(review_report_path, str):
+        return _refuse_merge(state, reason="review_invalid")
 
     return {
         "status": "awaiting_human",
@@ -146,6 +156,17 @@ def _audit_precheck_node(state: MergeGateState) -> MergeGateState:
         "audit_report_path": audit_report_path,
         "audit_verdict": audit_verdict,
     }
+
+
+def _handoff_generate_node(state: MergeGateState) -> MergeGateState:
+    record_path = generate_pending_handoff(
+        contract_path=state["contract_path"],
+        run_id=state["run_id"],
+        source_branch=state["source_branch"],
+        events_path=state["events_path"],
+        execution_repo_path=state["execution_repo_path"],
+    )
+    return {"handoff_path": str(record_path)}
 
 
 def _human_decision_node(state: MergeGateState) -> MergeGateState:
@@ -168,6 +189,8 @@ def _human_decision_node(state: MergeGateState) -> MergeGateState:
     reason = response.get("reason", "")
     if not isinstance(reason, str):
         raise ValueError("human rejection reason must be a string")
+    if decision == "reject" and not reason.strip():
+        raise ValueError("human rejection reason must be a non-empty string")
     return {
         "human_decision": decision,
         "rejection_reason": reason.strip(),
@@ -202,7 +225,6 @@ def _approve_node(state: MergeGateState) -> MergeGateState:
         state=state,
     )
     merge_commit = _run_git("git rev-parse HEAD", state=state).strip()
-    _run_git(f"git branch -d {quote(source_branch)}", state=state)
     append_event(
         Event(
             ts=_utc_now(),
@@ -218,6 +240,13 @@ def _approve_node(state: MergeGateState) -> MergeGateState:
         ),
         path=state["events_path"],
     )
+    mark_handoff_merged(
+        contract_path=state["contract_path"],
+        run_id=state["run_id"],
+        merge_commit=merge_commit,
+        events_path=state["events_path"],
+    )
+    _run_git(f"git branch -d {quote(source_branch)}", state=state)
     return {"status": "merged", "merge_commit": merge_commit}
 
 
@@ -235,6 +264,12 @@ def _reject_node(state: MergeGateState) -> MergeGateState:
             },
         ),
         path=state["events_path"],
+    )
+    mark_handoff_rejected(
+        contract_path=state["contract_path"],
+        run_id=state["run_id"],
+        reject_reason=state.get("rejection_reason", ""),
+        events_path=state["events_path"],
     )
     return {"status": "rejected"}
 
@@ -333,7 +368,11 @@ def _terminal_decision_provider(presentation: dict[str, object]) -> dict[str, st
         print("Enter approve or reject.")
     if decision == "approve":
         return {"decision": "approve"}
-    reason = input("Reason (optional): ").strip()
+    reason = ""
+    while not reason:
+        reason = input("Reason (required): ").strip()
+        if not reason:
+            print("Enter a rejection reason.")
     return {"decision": "reject", "reason": reason}
 
 

@@ -1,0 +1,10 @@
+covers_req: MAT-REQ-001
+merge_status: rejected
+reject_reason: "移除功能没有测试覆盖；工作自我报告不可靠"
+deferred:
+  - text: "前端移除入口与确认弹窗"
+    origin: contract
+    defer_to: MAT-REQ-001/S2
+  - text: "删除后页面重定向与反馈"
+    origin: contract
+    defer_to: MAT-REQ-001/S3

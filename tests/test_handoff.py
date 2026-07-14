@@ -147,6 +147,26 @@ def _init_rename_repo(repo_path: Path) -> None:
     _git(repo_path, "switch", "main")
 
 
+def _init_promoted_test_helper_repo(repo_path: Path) -> None:
+    _git(repo_path, "init", "-b", "main")
+    _git(repo_path, "config", "user.name", "Loom Tests")
+    _git(repo_path, "config", "user.email", "loom-tests@example.com")
+    helper_path = repo_path / "tests" / "helper.py"
+    helper_path.parent.mkdir(parents=True)
+    helper_path.write_text(
+        "def promoted_helper(value: int) -> int:\n    return value\n",
+        encoding="utf-8",
+    )
+    _git(repo_path, "add", "-A")
+    _git(repo_path, "commit", "-m", "baseline")
+
+    _git(repo_path, "switch", "-c", SOURCE_BRANCH)
+    (repo_path / "app").mkdir()
+    _git(repo_path, "mv", "tests/helper.py", "app/promoted_helper.py")
+    _git(repo_path, "commit", "-m", "promote helper into application")
+    _git(repo_path, "switch", "main")
+
+
 def _top_level_keys(text: str) -> list[str]:
     return [
         line.split(":", 1)[0]
@@ -383,6 +403,30 @@ async def remove_material_tag(material_id: int) -> None:
             self.assertIn("  test_files: []", text)
             self.assertNotIn("exported(value", text)
             self.assertNotIn("tests/test_new_name.py", text)
+
+    def test_rename_from_tests_to_application_creates_public_seam(self) -> None:
+        handoff = importlib.import_module("loom.handoff")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo_path = root / "lingua-web"
+            repo_path.mkdir()
+            _init_promoted_test_helper_repo(repo_path)
+            events_path = root / "events.jsonl"
+
+            record_path = handoff.generate_pending_handoff(
+                contract_path=CONTRACT_PATH,
+                run_id=RUN_ID,
+                source_branch=SOURCE_BRANCH,
+                events_path=events_path,
+                execution_repo_path=repo_path,
+            )
+
+            text = record_path.read_text(encoding="utf-8")
+            self.assertIn(
+                'signature: "promoted_helper(value: int) -> int"',
+                text,
+            )
+            self.assertIn("  test_files: []", text)
 
     def test_approve_updates_pending_record_to_merged_with_actual_commit(self) -> None:
         handoff = importlib.import_module("loom.handoff")

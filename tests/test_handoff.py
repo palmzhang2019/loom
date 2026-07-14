@@ -112,8 +112,38 @@ def _init_seam_repo(repo_path: Path, *, add_test_file: bool = True) -> None:
             "def test_remove_material_tag() -> None:\n    pass\n",
             encoding="utf-8",
         )
+        (repo_path / "tests" / "helpers.py").write_text(
+            "def build_material() -> object:\n    return object()\n",
+            encoding="utf-8",
+        )
     _git(repo_path, "add", "-A")
     _git(repo_path, "commit", "-m", "segment artifact")
+    _git(repo_path, "switch", "main")
+
+
+def _init_rename_repo(repo_path: Path) -> None:
+    _git(repo_path, "init", "-b", "main")
+    _git(repo_path, "config", "user.name", "Loom Tests")
+    _git(repo_path, "config", "user.email", "loom-tests@example.com")
+    source_path = repo_path / "app" / "old_name.py"
+    source_path.parent.mkdir(parents=True)
+    source_path.write_text(
+        "def exported(value: int) -> int:\n    return value\n",
+        encoding="utf-8",
+    )
+    test_path = repo_path / "tests" / "test_old_name.py"
+    test_path.parent.mkdir(parents=True)
+    test_path.write_text(
+        "def test_exported() -> None:\n    pass\n",
+        encoding="utf-8",
+    )
+    _git(repo_path, "add", "-A")
+    _git(repo_path, "commit", "-m", "baseline")
+
+    _git(repo_path, "switch", "-c", SOURCE_BRANCH)
+    _git(repo_path, "mv", "app/old_name.py", "app/new_name.py")
+    _git(repo_path, "mv", "tests/test_old_name.py", "tests/test_new_name.py")
+    _git(repo_path, "commit", "-m", "rename without interface changes")
     _git(repo_path, "switch", "main")
 
 
@@ -193,6 +223,7 @@ class HandoffRecordTests(unittest.TestCase):
             self.assertIn("merge_commit: null", text)
             self.assertIn("test_files:", text)
             self.assertIn("- tests/test_remove_material_tag.py", text)
+            self.assertNotIn("- tests/helpers.py", text)
             self.assertNotIn('signature: "test_remove_material_tag() -> None"', text)
             self.assertIn("as_built_diagram: null", text)
 
@@ -299,6 +330,59 @@ def list_items() -> list[str]:
             [(seam.kind, seam.signature) for seam in seams],
             [("route", "GET /items/new")],
         )
+
+    def test_prefixed_router_allows_existing_empty_path(self) -> None:
+        handoff = importlib.import_module("loom.handoff")
+        before = """\
+from fastapi import APIRouter
+
+router = APIRouter(prefix="/materials")
+
+@router.get("")
+async def material_index() -> None:
+    pass
+"""
+        after = before + """\
+
+@router.post("/{material_id}/tag/remove")
+async def remove_material_tag(material_id: int) -> None:
+    pass
+"""
+
+        seams = handoff.extract_python_seams(
+            [handoff.SourcePair(path="app/routes/upload.py", before=before, after=after)]
+        )
+
+        self.assertEqual(
+            [(seam.kind, seam.signature) for seam in seams],
+            [
+                ("route", "POST /materials/{material_id}/tag/remove"),
+                ("function", "async remove_material_tag(material_id: int) -> None"),
+            ],
+        )
+
+    def test_pure_renames_do_not_create_seams_or_new_test_pointers(self) -> None:
+        handoff = importlib.import_module("loom.handoff")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo_path = root / "lingua-web"
+            repo_path.mkdir()
+            _init_rename_repo(repo_path)
+            events_path = root / "events.jsonl"
+
+            record_path = handoff.generate_pending_handoff(
+                contract_path=CONTRACT_PATH,
+                run_id=RUN_ID,
+                source_branch=SOURCE_BRANCH,
+                events_path=events_path,
+                execution_repo_path=repo_path,
+            )
+
+            text = record_path.read_text(encoding="utf-8")
+            self.assertIn("seams: []", text)
+            self.assertIn("  test_files: []", text)
+            self.assertNotIn("exported(value", text)
+            self.assertNotIn("tests/test_new_name.py", text)
 
     def test_approve_updates_pending_record_to_merged_with_actual_commit(self) -> None:
         handoff = importlib.import_module("loom.handoff")

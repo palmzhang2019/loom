@@ -60,7 +60,21 @@ def _init_merge_repo(repo_path: Path) -> tuple[str, str]:
     _git(repo_path, "switch", "-c", SOURCE_BRANCH)
     artifact_path = repo_path / "app" / "routes" / "upload.py"
     artifact_path.parent.mkdir(parents=True)
-    artifact_path.write_text("remove route\n", encoding="utf-8")
+    artifact_path.write_text(
+        "\n".join(
+            [
+                "from fastapi import APIRouter",
+                "",
+                'router = APIRouter(prefix="/materials")',
+                "",
+                '@router.post("/{material_id}/tag/remove")',
+                "async def remove_material_tag(material_id: int, tag_id: int) -> bool:",
+                "    return True",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
     _git(repo_path, "add", "app/routes/upload.py")
     _git(repo_path, "commit", "-m", "segment artifact")
     source_commit = _git(repo_path, "rev-parse", "HEAD").strip()
@@ -140,6 +154,18 @@ def _run_merge_gate(
     )
 
 
+def _handoff_path(root: Path) -> Path:
+    return root / "runs" / RUN_ID / "handoff" / "handoff.yaml"
+
+
+def _top_level_keys(text: str) -> list[str]:
+    return [
+        line.split(":", 1)[0]
+        for line in text.splitlines()
+        if line and not line.startswith(" ")
+    ]
+
+
 class HumanMergeGateTests(unittest.TestCase):
     def test_blocked_audit_refuses_before_interrupt_without_override(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -178,6 +204,10 @@ class HumanMergeGateTests(unittest.TestCase):
             self.assertFalse(
                 any(row["type"] in {"merge_completed", "merge_rejected"} for row in rows)
             )
+            self.assertFalse(_handoff_path(root).exists())
+            self.assertFalse(
+                any(row["type"] in {"handoff_generated", "handoff_updated"} for row in rows)
+            )
 
     def test_passed_audit_and_human_approve_merges_rehearsal_and_deletes_source(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -187,9 +217,11 @@ class HumanMergeGateTests(unittest.TestCase):
             main_commit, source_commit = _init_merge_repo(repo_path)
             events_path = _append_gate_inputs(root, audit_verdict="passed")
             presentations: list[dict[str, object]] = []
+            pending_records: list[str] = []
 
             def approve(value: dict[str, object]) -> dict[str, str]:
                 presentations.append(value)
+                pending_records.append(_handoff_path(root).read_text(encoding="utf-8"))
                 return {"decision": "approve"}
 
             result = _run_merge_gate(
@@ -199,6 +231,12 @@ class HumanMergeGateTests(unittest.TestCase):
             )
 
             self.assertEqual(len(presentations), 1)
+            self.assertEqual(len(pending_records), 1)
+            self.assertIn("merge_status: pending", pending_records[0])
+            self.assertIn(
+                'signature: "POST /materials/{material_id}/tag/remove"',
+                pending_records[0],
+            )
             self.assertEqual(
                 presentations[0],
                 {
@@ -233,6 +271,10 @@ class HumanMergeGateTests(unittest.TestCase):
             merge_message = _git(repo_path, "show", "-s", "--format=%B", merge_commit)
             self.assertIn(f"segment_id={SEGMENT_ID}", merge_message)
             self.assertIn(f"run_id={RUN_ID}", merge_message)
+            final_handoff = _handoff_path(root).read_text(encoding="utf-8")
+            self.assertIn("merge_status: merged", final_handoff)
+            self.assertIn(f'merge_commit: "{merge_commit}"', final_handoff)
+            self.assertIn("seams:", final_handoff)
 
             rows, _ = load_event_rows(events_path, run_id=RUN_ID)
             completed = [row for row in rows if row["type"] == "merge_completed"]
@@ -245,6 +287,16 @@ class HumanMergeGateTests(unittest.TestCase):
                     "target": TARGET_BRANCH,
                     "merge_commit": merge_commit,
                 },
+            )
+            lifecycle = [
+                row["type"]
+                for row in rows
+                if row["type"]
+                in {"handoff_generated", "merge_completed", "handoff_updated"}
+            ]
+            self.assertEqual(
+                lifecycle,
+                ["handoff_generated", "merge_completed", "handoff_updated"],
             )
             commands = [
                 row["payload"]["cmd"]
@@ -262,9 +314,11 @@ class HumanMergeGateTests(unittest.TestCase):
             main_commit, _ = _init_merge_repo(repo_path)
             events_path = _append_gate_inputs(root, audit_verdict="passed")
             presentations: list[dict[str, object]] = []
+            pending_records: list[str] = []
 
             def reject(value: dict[str, object]) -> dict[str, str]:
                 presentations.append(value)
+                pending_records.append(_handoff_path(root).read_text(encoding="utf-8"))
                 return {"decision": "reject", "reason": "human requested changes"}
 
             result = _run_merge_gate(
@@ -274,6 +328,9 @@ class HumanMergeGateTests(unittest.TestCase):
             )
 
             self.assertEqual(len(presentations), 1)
+            self.assertEqual(len(pending_records), 1)
+            self.assertIn("merge_status: pending", pending_records[0])
+            self.assertIn("seams:", pending_records[0])
             self.assertEqual(result["status"], "rejected")
             self.assertTrue(_branch_exists(repo_path, SOURCE_BRANCH))
             self.assertFalse(_branch_exists(repo_path, TARGET_BRANCH))
@@ -300,6 +357,24 @@ class HumanMergeGateTests(unittest.TestCase):
                 [asdict(item) for item in retained],
             )
             self.assertFalse(any(row["type"] == "merge_completed" for row in rows))
+            final_handoff = _handoff_path(root).read_text(encoding="utf-8")
+            self.assertEqual(
+                _top_level_keys(final_handoff),
+                ["covers_req", "merge_status", "reject_reason", "deferred"],
+            )
+            self.assertIn("merge_status: rejected", final_handoff)
+            self.assertIn('reject_reason: "human requested changes"', final_handoff)
+            self.assertNotIn("seams:", final_handoff)
+            lifecycle = [
+                row["type"]
+                for row in rows
+                if row["type"]
+                in {"handoff_generated", "merge_rejected", "handoff_updated"}
+            ]
+            self.assertEqual(
+                lifecycle,
+                ["handoff_generated", "merge_rejected", "handoff_updated"],
+            )
 
 
 if __name__ == "__main__":

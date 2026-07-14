@@ -65,3 +65,16 @@
 - P4-1 首次 review 遇到的实现恰好正确,四条 AC 全"满足",未见 review 报"存疑/不满足"的样本。
 - review 能否如实抓出有问题的实现,尚未验证。待自然出现或专门构造一个有缺陷的实现时检验。
 - 提醒:P4-3 合入前,若尚未建立对 review 的信任,不应只看报告、需人工核对 diff。
+
+## audit 硬闸的两个已修缺陷(P4-2,验收逼出)
+- secret 闸曾因结尾 \b 遇非 ASCII 字符失效而漏报(sk-...<Unicode> 绕过);已改 ASCII 明确边界。
+- scope 闸曾把"无观测记录"当空集合 vacuous pass;已改为无证据即 blocked(no_observed_changes,fail-closed)。
+- 教训:安全硬闸必须验 blocked 路径(该拦时真拦),不能只验 passed;"没数据"默认必须是"不放行"而非"通过"。
+
+## review 缺"测试充分性"检查(P4-3 真实 reject 暴露)
+- P4-3 首次真实合入决策:review 报"四条 AC 满足"、audit passed,但人工查证发现 remove 功能无任何测试覆盖
+  (59 passed 全是原有 add/tagging 测试),work 自报"checks passed"实为 exit 130(不可采信)。
+- 根因:review 只做了 spec 一致性(LLM 读代码判 AC),未做"测试充分性"检查——AC 满足与否无测试背书。
+- 若当时信报告 approve,未验证功能即合入。故 reject。
+- 待办:review 需补"测试充分性"项(每条 AC 是否有对应测试覆盖);这是 review 可信度的关键,非可选。
+- 更上游:test_selectors 只选了现有测试,没有"为本 segment 新功能生成测试"的环节(BRIEF 里的 test 按 spec 派生,尚未做)。

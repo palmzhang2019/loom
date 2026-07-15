@@ -12,7 +12,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from loom.events import Event, append_event
 from loom.harness import CommandResult
-from loom.review import ReviewSessionInput, _run_codex_review_session, run_segment_review
+from loom.review import (
+    ReviewSessionInput,
+    _run_codex_review_session,
+    _validate_sequence_diagram,
+    run_segment_review,
+)
 from loom.view import load_event_rows
 
 
@@ -148,6 +153,7 @@ class SegmentReviewTests(unittest.TestCase):
             self.assertIn("## LLM 建议(供人参考)", report)
             hard_facts, llm_advice = report.split("## LLM 建议(供人参考)", 1)
             self.assertNotIn("```mermaid", hard_facts)
+            self.assertNotIn("\n## ", llm_advice)
             self.assertEqual(llm_advice.count("```mermaid"), 2)
             self.assertIn("### 契约时序图(设计意图,人类所写)", llm_advice)
             self.assertIn(
@@ -172,6 +178,18 @@ class SegmentReviewTests(unittest.TestCase):
                 llm_advice,
             )
             self.assertIn("是否构成漂移由人类判断", llm_advice)
+            reverse_observations = llm_advice.split(
+                "反向生成图中有、契约图中没有的交互:\n",
+                1,
+            )[1].split("\n\n契约图中有、反向生成图中没有的交互:", 1)[0]
+            contract_observations = llm_advice.split(
+                "契约图中有、反向生成图中没有的交互:\n",
+                1,
+            )[1].split("\n\n### 逐条 AC review 意见", 1)[0]
+            self.assertIn("upload路由 -> 审计记录: 记录删除动作", reverse_observations)
+            self.assertNotIn("单独查询关联记录", reverse_observations)
+            self.assertIn("单独查询关联记录", contract_observations)
+            self.assertNotIn("审计记录", contract_observations)
             self.assertEqual(report.count("LLM意见:满足"), 4)
             for index in range(1, 5):
                 self.assertIn(f"MAT-REQ-001/S1/AC{index}", report)
@@ -187,6 +205,13 @@ class SegmentReviewTests(unittest.TestCase):
                 received[0].reverse_sequence_diagram,
                 REVERSE_SEQUENCE_DIAGRAM,
             )
+            contract_block = (
+                f"```mermaid\n{received[0].contract_sequence_diagram}\n```"
+            )
+            reverse_block = f"```mermaid\n{REVERSE_SEQUENCE_DIAGRAM}\n```"
+            self.assertEqual(llm_advice.count(contract_block), 1)
+            self.assertEqual(llm_advice.count(reverse_block), 1)
+            self.assertLess(llm_advice.index(contract_block), llm_advice.index(reverse_block))
 
             rows, invalid_lines = load_event_rows(events_path, run_id=RUN_ID)
             self.assertEqual(invalid_lines, [])
@@ -229,7 +254,7 @@ class SegmentReviewTests(unittest.TestCase):
             self.assertIn("tests/test_s3t_tagging.py", report)
             self.assertEqual(report.count("LLM意见:满足"), 4)
 
-    def test_reverse_generation_prompt_excludes_contract_diagram_and_acceptance(self) -> None:
+    def test_default_sessions_run_in_order_and_reverse_prompt_excludes_contract(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             events_path = root / "events.jsonl"
@@ -262,7 +287,19 @@ class SegmentReviewTests(unittest.TestCase):
                 encoding="utf-8",
             )
             _append_files_changed(events_path, ["app/routes/upload.py"])
+            runtime_dir = root / "runs" / RUN_ID / "review"
+            runtime_dir.mkdir(parents=True)
+            (runtime_dir / "codex-reverse-sequence.json").write_text(
+                '{"sequence_diagram":"STALE_REVERSE_OUTPUT"}',
+                encoding="utf-8",
+            )
+            (runtime_dir / "codex-review.json").write_text(
+                '{"summary":"STALE_COMPARISON_OUTPUT"}',
+                encoding="utf-8",
+            )
             reverse_prompts: list[str] = []
+            comparison_prompts: list[str] = []
+            codex_commands: list[str] = []
 
             def fake_run_observed(
                 cmd, *, segment_id, run_id, cwd=None, path=None, payload=None
@@ -277,34 +314,70 @@ class SegmentReviewTests(unittest.TestCase):
                         "",
                         0.1,
                     )
-                prompt_path = (
-                    root
-                    / "runs"
-                    / RUN_ID
-                    / "review"
-                    / "reverse-sequence-prompt.txt"
-                )
-                prompt = prompt_path.read_text(encoding="utf-8")
-                reverse_prompts.append(prompt)
-                self.assertIn(diff_nonce, prompt)
-                self.assertNotIn(contract_diagram_nonce, prompt)
-                self.assertNotIn(acceptance_nonce, prompt)
-                self.assertNotIn("Acceptance criteria:", prompt)
+                codex_commands.append(cmd)
                 self.assertIn("codex exec", cmd)
                 self.assertIn("--sandbox read-only", cmd)
                 self.assertNotIn("resume", cmd)
                 self.assertEqual(Path(cwd), repo_path)
-                self.assertEqual(
-                    payload,
-                    {"role": "review", "artifact": "reverse_sequence_diagram"},
-                )
-                output_path = (
-                    root / "runs" / RUN_ID / "review" / "codex-reverse-sequence.json"
-                )
-                output_path.write_text(
-                    json.dumps({"sequence_diagram": REVERSE_SEQUENCE_DIAGRAM}),
-                    encoding="utf-8",
-                )
+                if len(codex_commands) == 1:
+                    prompt = (runtime_dir / "reverse-sequence-prompt.txt").read_text(
+                        encoding="utf-8"
+                    )
+                    reverse_prompts.append(prompt)
+                    self.assertIn(diff_nonce, prompt)
+                    self.assertNotIn(contract_diagram_nonce, prompt)
+                    self.assertNotIn(acceptance_nonce, prompt)
+                    self.assertNotIn("Acceptance criteria:", prompt)
+                    self.assertIn(
+                        "所有人类可见的 participant 名称和消息文字必须使用中文",
+                        prompt,
+                    )
+                    self.assertEqual(
+                        payload,
+                        {"role": "review", "artifact": "reverse_sequence_diagram"},
+                    )
+                    reverse_output_path = runtime_dir / "codex-reverse-sequence.json"
+                    self.assertNotIn(
+                        "STALE_REVERSE_OUTPUT",
+                        reverse_output_path.read_text(encoding="utf-8"),
+                    )
+                    reverse_output_path.write_text(
+                        json.dumps({"sequence_diagram": REVERSE_SEQUENCE_DIAGRAM}),
+                        encoding="utf-8",
+                    )
+                else:
+                    prompt = (runtime_dir / "prompt.txt").read_text(encoding="utf-8")
+                    comparison_prompts.append(prompt)
+                    self.assertIn(diff_nonce, prompt)
+                    self.assertIn(contract_diagram_nonce, prompt)
+                    self.assertIn(acceptance_nonce, prompt)
+                    self.assertIn(REVERSE_SEQUENCE_DIAGRAM, prompt)
+                    self.assertIn(
+                        "差异观察、逐条 AC 意见的理由和总体摘要必须使用中文",
+                        prompt,
+                    )
+                    comparison_output_path = runtime_dir / "codex-review.json"
+                    self.assertNotIn(
+                        "STALE_COMPARISON_OUTPUT",
+                        comparison_output_path.read_text(encoding="utf-8"),
+                    )
+                    comparison_output_path.write_text(
+                        json.dumps(
+                            {
+                                "opinions": [
+                                    {
+                                        "acceptance_id": "MAT-REQ-001/S1/AC1",
+                                        "opinion": "存疑",
+                                        "reason": "由人类结合两图判断",
+                                    }
+                                ],
+                                "reverse_only_interactions": [],
+                                "contract_only_interactions": [],
+                                "summary": "两图语义比较仅供参考",
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
                 return CommandResult(0, "", "", 0.1)
 
             with patch("loom.review.run_observed", side_effect=fake_run_observed):
@@ -314,10 +387,23 @@ class SegmentReviewTests(unittest.TestCase):
                     reviewed_branch=BRANCH_NAME,
                     events_path=events_path,
                     execution_repo_path=repo_path,
-                    review_runner=_mock_review,
                 )
 
             self.assertEqual(len(reverse_prompts), 1)
+            self.assertEqual(len(comparison_prompts), 1)
+            self.assertEqual(len(codex_commands), 2)
+            self.assertIn("codex-reverse-sequence.json", codex_commands[0])
+            self.assertIn("codex-review.json", codex_commands[1])
+
+    def test_reverse_sequence_validation_rejects_non_mermaid_body(self) -> None:
+        invalid_diagrams = [
+            "sequenceDiagram\nnot a participant or interaction",
+            "sequenceDiagram\n    participant Client",
+        ]
+        for diagram in invalid_diagrams:
+            with self.subTest(diagram=diagram):
+                with self.assertRaisesRegex(ValueError, "participant.*message arrow"):
+                    _validate_sequence_diagram(diagram)
 
     def test_default_review_runner_uses_fresh_read_only_codex_comparison_session(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -364,6 +450,10 @@ class SegmentReviewTests(unittest.TestCase):
                 prompt = prompt_path.read_text(encoding="utf-8")
                 self.assertIn("Contract->>Contract: 契约交互", prompt)
                 self.assertIn("Built->>Built: 实现交互", prompt)
+                self.assertIn(
+                    "差异观察、逐条 AC 意见的理由和总体摘要必须使用中文",
+                    prompt,
+                )
                 self.assertIn("codex exec", cmd)
                 self.assertIn("--sandbox read-only", cmd)
                 self.assertNotIn("resume", cmd)

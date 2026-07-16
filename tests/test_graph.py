@@ -75,90 +75,7 @@ class P3ALangGraphTests(unittest.TestCase):
             self.assertNotIn("raw_text", orchestrator_finished["payload"]["result"]["segment"])
             self.assertEqual(
                 orchestrator_finished["payload"]["result"]["segment"],
-                {
-                    "contract_path": str(contract_path),
-                    "acceptance_ids": [
-                        "MAT-REQ-001/S1/AC1",
-                        "MAT-REQ-001/S1/AC2",
-                        "MAT-REQ-001/S1/AC3",
-                        "MAT-REQ-001/S1/AC4",
-                    ],
-                    "segment_id": "MAT-REQ-001/S1",
-                    "covers_req": "MAT-REQ-001",
-                    "title": "后端移除来源标签的路由与删除逻辑",
-                    "acceptance": [
-                        {
-                            "id": "MAT-REQ-001/S1/AC1",
-                            "text": '在 app/routes/upload.py 中新增一个与现有 POST /materials/{material_id}/tag/add 对称的移除路由,接收"移除某个来源标签关联"的请求',
-                        },
-                        {
-                            "id": "MAT-REQ-001/S1/AC2",
-                            "text": "删除的是 app/models.py 中 MaterialKnowledgeTagLink 的关联记录,不是 KnowledgeTag 标签本身",
-                        },
-                        {
-                            "id": "MAT-REQ-001/S1/AC3",
-                            "text": "删除成功后,该素材详情页读取到的已挂载来源标签列表中不再包含被移除项",
-                        },
-                        {
-                            "id": "MAT-REQ-001/S1/AC4",
-                            "text": "对不存在的关联发起删除,返回明确失败/无操作,不报 500",
-                        },
-                    ],
-                    "anti_scope": [
-                        {
-                            "text": "前端移除入口与确认弹窗",
-                            "kind": "defer",
-                            "defer_to": "MAT-REQ-001/S2",
-                        },
-                        {
-                            "text": "删除后页面重定向与反馈",
-                            "kind": "defer",
-                            "defer_to": "MAT-REQ-001/S3",
-                        },
-                        {
-                            "text": "批量移除",
-                            "kind": "out_of_req",
-                        },
-                        {
-                            "text": "KnowledgeTag 标签本身的增删(只删 MaterialKnowledgeTagLink 关联)",
-                            "kind": "out_of_req",
-                        },
-                        {
-                            "text": "app/routes/knowledge.py 的 tag 过滤/反查 source tags 读路径(删关联后自然反映,S1 不主动碰)",
-                            "kind": "out_of_req",
-                        },
-                        {
-                            "text": "app/services/tagging.py 的标签规范化/绑定逻辑(S1 只做解绑,不改绑定侧)",
-                            "kind": "out_of_req",
-                        },
-                    ],
-                    "scope_paths": [
-                        "app/routes/upload.py",
-                        "app/models.py",
-                    ],
-                    "test_selectors": [
-                        "tests/test_s3t_tagging.py",
-                        "tests/test_s4bb_material_tag_wiring.py",
-                    ],
-                    "sequence_diagram": "\n".join(
-                        [
-                            "sequenceDiagram",
-                            "    participant Client as 请求方",
-                            "    participant Route as upload路由",
-                            "    participant Model as MaterialKnowledgeTagLink",
-                            "    Client->>Route: POST 移除关联(material_id, tag_id)",
-                            "    Route->>Model: 查询该 material 与 tag 的关联记录",
-                            "    alt 关联存在",
-                            "        Route->>Model: 删除该关联记录",
-                            "        Model-->>Route: 删除成功",
-                            "        Route-->>Client: 成功响应",
-                            "    else 关联不存在",
-                            "        Model-->>Route: 未找到关联",
-                            "        Route-->>Client: 明确失败响应(非500)",
-                            "    end",
-                        ]
-                    ),
-                },
+                _load_segment_contract(contract_path),
             )
             self.assertFalse((worktree_root / "MAT-REQ-001-S1").exists())
             command_runs = [row for row in rows if row["type"] == "command_run"]
@@ -379,52 +296,15 @@ class P3ALangGraphTests(unittest.TestCase):
             )
             self.assertEqual(
                 asdict(received_input)["acceptance"],
-                [
-                    {
-                        "id": "MAT-REQ-001/S1/AC1",
-                        "text": '在 app/routes/upload.py 中新增一个与现有 POST /materials/{material_id}/tag/add 对称的移除路由,接收"移除某个来源标签关联"的请求',
-                    },
-                    {
-                        "id": "MAT-REQ-001/S1/AC2",
-                        "text": "删除的是 app/models.py 中 MaterialKnowledgeTagLink 的关联记录,不是 KnowledgeTag 标签本身",
-                    },
-                    {
-                        "id": "MAT-REQ-001/S1/AC3",
-                        "text": "删除成功后,该素材详情页读取到的已挂载来源标签列表中不再包含被移除项",
-                    },
-                    {
-                        "id": "MAT-REQ-001/S1/AC4",
-                        "text": "对不存在的关联发起删除,返回明确失败/无操作,不报 500",
-                    },
-                ],
+                _load_segment_contract(contract_path)["acceptance"],
             )
             self.assertEqual(
                 received_input.sequence_diagram,
-                "\n".join(
-                    [
-                        "sequenceDiagram",
-                        "    participant Client as 请求方",
-                        "    participant Route as upload路由",
-                        "    participant Model as MaterialKnowledgeTagLink",
-                        "    Client->>Route: POST 移除关联(material_id, tag_id)",
-                        "    Route->>Model: 查询该 material 与 tag 的关联记录",
-                        "    alt 关联存在",
-                        "        Route->>Model: 删除该关联记录",
-                        "        Model-->>Route: 删除成功",
-                        "        Route-->>Client: 成功响应",
-                        "    else 关联不存在",
-                        "        Model-->>Route: 未找到关联",
-                        "        Route-->>Client: 明确失败响应(非500)",
-                        "    end",
-                    ]
-                ),
+                _load_segment_contract(contract_path)["sequence_diagram"],
             )
             self.assertEqual(
                 received_input.test_selectors,
-                [
-                    "tests/test_s3t_tagging.py",
-                    "tests/test_s4bb_material_tag_wiring.py",
-                ],
+                _load_segment_contract(contract_path)["test_selectors"],
             )
             self.assertFalse(hasattr(received_input, "diff"))
             self.assertFalse(hasattr(received_input, "summary"))

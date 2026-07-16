@@ -11,6 +11,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from loom.events import Event, append_event
+from loom.graph import _load_segment_contract
 from loom.harness import CommandResult
 from loom.review import (
     ReviewSessionInput,
@@ -147,6 +148,7 @@ class SegmentReviewTests(unittest.TestCase):
 
             self.assertEqual(report_path, root / "runs" / RUN_ID / "review" / "review.md")
             report = report_path.read_text(encoding="utf-8")
+            acceptance = _load_segment_contract(CONTRACT_PATH)["acceptance"]
             self.assertIn("## 硬事实(harness 观测)", report)
             self.assertIn("scope 检查结果: 合规", report)
             self.assertIn("app/routes/upload.py", report)
@@ -190,16 +192,16 @@ class SegmentReviewTests(unittest.TestCase):
             self.assertNotIn("单独查询关联记录", reverse_observations)
             self.assertIn("单独查询关联记录", contract_observations)
             self.assertNotIn("审计记录", contract_observations)
-            self.assertEqual(report.count("LLM意见:满足"), 4)
-            for index in range(1, 5):
-                self.assertIn(f"MAT-REQ-001/S1/AC{index}", report)
+            self.assertEqual(report.count("LLM意见:满足"), len(acceptance))
+            for item in acceptance:
+                self.assertIn(item["id"], report)
             self.assertNotIn("PASS", report)
             self.assertNotIn("FAIL", report)
 
             self.assertEqual(len(received), 1)
             self.assertEqual(received[0].reviewed_branch, BRANCH_NAME)
             self.assertIn("diff --git a/app/routes/upload.py", received[0].diff)
-            self.assertEqual(len(received[0].acceptance), 4)
+            self.assertEqual(len(received[0].acceptance), len(acceptance))
             self.assertTrue(received[0].contract_sequence_diagram.startswith("sequenceDiagram"))
             self.assertEqual(
                 received[0].reverse_sequence_diagram,
@@ -249,10 +251,11 @@ class SegmentReviewTests(unittest.TestCase):
             )
 
             report = report_path.read_text(encoding="utf-8")
+            acceptance = _load_segment_contract(CONTRACT_PATH)["acceptance"]
             self.assertIn("scope 检查结果: 越界", report)
             self.assertIn("越界文件:", report)
             self.assertIn("tests/test_s3t_tagging.py", report)
-            self.assertEqual(report.count("LLM意见:满足"), 4)
+            self.assertEqual(report.count("LLM意见:满足"), len(acceptance))
 
     def test_default_sessions_run_in_order_and_reverse_prompt_excludes_contract(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

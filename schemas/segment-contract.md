@@ -117,7 +117,16 @@ test_selectors:
 
 ### preview `(seq 图必填;html 条件必填)`
 **既是预览,也是验收靶子** —— P4 从代码反向生成图/html,与此比对,检测漂移。
-- `sequence_diagram` —— **每个 segment 必填**。任何 segment 都有交互时序(后端也有 `请求→路由→删关联→返回`),它是 test agent 的黑盒 oracle(照时序验,不看实现)。
+
+- `sequence_diagram` —— **必填,且必须是合法 mermaid `sequenceDiagram`**(含 participant 声明与箭头语法),
+  不接受伪代码或自由文本。任何 segment 都有交互时序(后端也是 `请求→路由→删关联→返回`),
+  它是 test agent 的黑盒 oracle(照时序验,不看实现)。
+  - 理由:它既是设计意图的表达,也是 review 反向生成对比的基准 —— 两边同为合法 mermaid 才能对比;
+    且能在 review 报告中直接渲染成图供人类审阅,服务于"人类看图与报告做判断,不逐行读代码"。
+  - 一致性要求:须完整表达契约的 acceptance,**包括失败/边界路径**(用 alt/else 表达)。
+    若某条 AC 描述了一条路径(如"关联不存在时返回明确失败"),时序图须体现它;
+    否则反向生成的实现含该分支、契约图没有,对比会误报漂移。
+
 - `html_preview` —— **条件必填**:仅当 segment 有用户可见界面时要求。
   触发条件:`scope_paths` 是否含 UI 目录(如 `src/frontend/`)——含则必填,纯后端免。
   (关联逻辑的实现属 P4,此处仅定义规则。)

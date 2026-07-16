@@ -10,6 +10,8 @@ acceptance:
     text: 删除成功后,该素材详情页读取到的已挂载来源标签列表中不再包含被移除项
   - id: MAT-REQ-001/S1/AC4
     text: 对不存在的关联发起删除,返回明确失败/无操作,不报 500
+  - id: MAT-REQ-001/S1/AC5
+    text: 对不存在的素材发起删除,返回明确失败(未找到素材),不报 500
 anti_scope:
   - text: 前端移除入口与确认弹窗
     kind: defer
@@ -34,8 +36,23 @@ test_selectors:
   - tests/test_s4bb_material_tag_wiring.py
 preview:
   sequence_diagram: |
-    请求 -> upload路由: 移除关联(material_id, tag_id)
-    upload路由 -> models(MaterialKnowledgeTagLink): 删除该关联记录
-    models --> upload路由: 删除结果(成功/无该关联)
-    upload路由 --> 请求: 成功/失败响应
+    sequenceDiagram
+        participant Client as 请求方
+        participant Route as upload路由
+        participant Model as MaterialKnowledgeTagLink
+        Client->>Route: POST 移除关联(material_id, tag_id)
+        Route->>Route: 查询素材是否存在
+        alt 素材不存在
+            Route-->>Client: 明确失败响应(未找到素材,非500)
+        else 素材存在
+            Route->>Model: 查询该 material 与 tag 的关联记录
+            alt 关联存在
+                Route->>Model: 删除该关联记录
+                Model-->>Route: 删除成功
+                Route-->>Client: 成功响应
+            else 关联不存在
+                Model-->>Route: 未找到关联
+                Route-->>Client: 明确失败响应(非500)
+            end
+        end
   # html_preview: 免(S1 无 UI)
